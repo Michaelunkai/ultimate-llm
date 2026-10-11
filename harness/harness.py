@@ -29,9 +29,37 @@ from datetime import datetime
 from pathlib import Path
 
 # --- Core dependencies (critical path) -------------------------------------
-import httpx
-import psutil
-import pyperclip
+# Heavy modules are lazy-loaded (sub-second startup matters): the REPL banner
+# must not wait on httpx/psutil/pyperclip, which are only needed on first tool use.
+httpx = None
+psutil = None
+pyperclip = None
+
+
+def _httpx():
+    global httpx
+    if httpx is None:
+        import httpx as _mod
+        httpx = _mod
+    return httpx
+
+
+def _psutil():
+    global psutil
+    if psutil is None:
+        import psutil as _mod
+        psutil = _mod
+    return psutil
+
+
+def _pyperclip():
+    global pyperclip
+    if pyperclip is None:
+        import pyperclip as _mod
+        pyperclip = _mod
+    return pyperclip
+
+
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -514,7 +542,7 @@ def _clean_ddg_url(href: str) -> str:
 
 
 def _ddg_html_fallback(query: str, max_results: int) -> str:
-    resp = httpx.get(
+    resp = _httpx().get(
         "https://html.duckduckgo.com/html/",
         params={"q": query},
         headers={"User-Agent": USER_AGENT},
@@ -613,7 +641,7 @@ def tool_fetch_url(args: dict) -> str:
             max_bytes = max(1000, int(args.get("max_bytes", 400000) or 400000))
         except (TypeError, ValueError):
             max_bytes = 400000
-        with httpx.Client(timeout=30.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+        with _httpx().Client(timeout=30.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
             resp = client.get(url)
         resp.raise_for_status()
         raw = resp.content[:max_bytes]
@@ -722,7 +750,7 @@ def tool_list_processes(args: dict) -> str:
     try:
         flt = str(args.get("filter", "") or "").strip().lower()
         rows = []
-        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+        for proc in _psutil().process_iter(["pid", "name", "memory_info"]):
             try:
                 name = proc.info.get("name") or "?"
                 if flt and flt not in name.lower():
@@ -763,18 +791,18 @@ def tool_stop_process(args: dict) -> str:
             return "ERROR: provide 'pid' or 'name' of the process to stop"
         if re.fullmatch(r"\d+", target):
             try:
-                proc = psutil.Process(int(target))
+                proc = _psutil().Process(int(target))
                 pname = proc.name()
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
-                except psutil.TimeoutExpired:
+                except _psutil().TimeoutExpired:
                     proc.kill()
                 return f"Stopped process {pname} (pid {target})."
-            except psutil.NoSuchProcess:
+            except _psutil().NoSuchProcess:
                 return f"ERROR: no process with pid {target}"
         victims = []
-        for proc in psutil.process_iter(["pid", "name"]):
+        for proc in _psutil().process_iter(["pid", "name"]):
             pname = proc.info.get("name") or ""
             if target.lower() in pname.lower():
                 victims.append(proc)
@@ -852,7 +880,7 @@ def tool_screenshot(args: dict) -> str:
 def tool_clipboard_get(args: dict) -> str:
     try:
         try:
-            text = pyperclip.paste()
+            text = _pyperclip().paste()
             if text is not None:
                 return text if text else "(clipboard is empty)"
         except Exception:
@@ -887,7 +915,7 @@ def tool_clipboard_set(args: dict) -> str:
             return "ERROR: text required"
         text = str(text)
         try:
-            pyperclip.copy(text)
+            _pyperclip().copy(text)
             return f"Copied {len(text)} chars to the clipboard."
         except Exception:
             pass
@@ -1388,7 +1416,7 @@ def chat_stream(console: Console):
         return Group(status, Markdown("".join(parts)[-6000:]))
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+        with _httpx().Client(timeout=_httpx().Timeout(600.0, connect=10.0)) as client:
             with client.stream("POST", url, json=payload) as resp:
                 if resp.status_code != 200:
                     detail = resp.read().decode("utf-8", errors="replace")[:400]
@@ -1417,11 +1445,11 @@ def chat_stream(console: Console):
                         if obj.get("done"):
                             break
                     live.update(_render_preview())
-    except httpx.ConnectError as exc:
+    except _httpx().ConnectError as exc:
         raise ConnectionError(f"cannot reach Ollama at {STATE['host']} ({exc})") from exc
-    except httpx.ConnectTimeout as exc:
+    except _httpx().ConnectTimeout as exc:
         raise ConnectionError(f"connection to Ollama at {STATE['host']} timed out ({exc})") from exc
-    except httpx.TransportError as exc:
+    except _httpx().TransportError as exc:
         raise ConnectionError(f"Ollama connection dropped ({exc})") from exc
     return "".join(parts), assembler.finalize()
 

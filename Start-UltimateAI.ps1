@@ -14,10 +14,22 @@
 #   -Offline     force offline model discovery
 #   -LaunchOnly  skip prereqs / pull / venv / alias, jump straight to launch
 #   -NoAlias     do not write the ultimate-ai.cmd shim / user PATH entry
+#   -Full        force the complete bootstrap (discovery, prereqs, alias) and
+#                refresh the cached fast-launch state
+#
+# Once a full bootstrap has succeeded once, normal runs take the FAST PATH:
+# interactive mode is up in well under one second, with the model warming in the
+# background (60-minute keep-alive) so the first message is instantly served.
 # =============================================================================
 
 param( [switch]$SelfTest, [switch]$SkipPull, [string]$Model, [switch]$Offline,
-       [switch]$LaunchOnly, [switch]$NoAlias )
+       [switch]$LaunchOnly, [switch]$NoAlias, [switch]$Full )
+
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$stateFile = Join-Path $PSScriptRoot '.bootstrap-state.json'
+$venvPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+$harnessFile = Join-Path $PSScriptRoot 'harness\harness.py'
+$fastLaunch = $false
 
 # ------------------------------------------------------------------ banner --
 Write-Host ''
@@ -41,20 +53,22 @@ function Write-BigChoice {
 }
 
 # --------------------------------------------------------------- dot-source --
-try {
-    . (Join-Path $PSScriptRoot 'lib\hardware-scan.ps1')
-    . (Join-Path $PSScriptRoot 'lib\discover-model.ps1')
-    . (Join-Path $PSScriptRoot 'lib\ensure-prereqs.ps1')
-}
-catch {
-    Write-Host ('[ERROR] failed to load lib modules: ' + $_.Exception.Message) -ForegroundColor Red
-    exit 1
-}
+# (deferred: only the paths that actually need the libs load them - the fast
+#  path must stay lean to keep interactive startup under one second)
 
 # =============================================================================
 # SELF TEST (fully offline: no pull, no install, no venv creation)
 # =============================================================================
 if ($SelfTest) {
+    try {
+        . (Join-Path $PSScriptRoot 'lib\hardware-scan.ps1')
+        . (Join-Path $PSScriptRoot 'lib\discover-model.ps1')
+        . (Join-Path $PSScriptRoot 'lib\ensure-prereqs.ps1')
+    }
+    catch {
+        Write-Host ('[ERROR] failed to load lib modules: ' + $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
     $failCount = 0
 
     # -- 1) parse-check every .ps1 under the deliverable root (incl. this file)
@@ -224,18 +238,52 @@ if ($SelfTest) {
 }
 
 # =============================================================================
+# FAST PATH - cached bootstrap: interactive mode in well under one second.
+# Taken automatically when a previous full bootstrap succeeded (state file) and
+# no explicit setup flag requests otherwise. -Full forces the complete path.
+# =============================================================================
+if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offline) -and
+    [string]::IsNullOrWhiteSpace($Model) -and (Test-Path -LiteralPath $stateFile) -and
+    (Test-Path -LiteralPath $venvPython) -and (Test-Path -LiteralPath $harnessFile)) {
+    $state = $null
+    try { $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json } catch { $state = $null }
+    if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.model)) {
+        $tag = [string]$state.model
+        try { $numCtx = [int]$state.num_ctx } catch { $numCtx = 0 }
+        $fastLaunch = $true
+        # Warm the model in the background (detached; 60-minute keep-alive) so the
+        # very first message does not wait for the weights to load.
+        try {
+            $warmCmd = "Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:11434/api/generate' -ContentType 'application/json' -TimeoutSec 300 -Body (@{ model='" + $tag + "'; prompt=''; keep_alive='60m'; stream=`$false } | ConvertTo-Json) | Out-Null"
+            Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $warmCmd) | Out-Null
+        }
+        catch { }
+        Write-Host ('[READY] fast launch: ' + $tag + ' - bootstrap cached (run with -Full to redo discovery/setup).') -ForegroundColor Cyan
+    }
+}
+
+# =============================================================================
 # NORMAL FLOW
 # =============================================================================
 
-$tag = ''
-$numCtx = $null
 $fitMode = ''
 $reason = ''
 $choice = $null
-$venvPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 
-if ($LaunchOnly) {
+if ($fastLaunch) {
+    # fast path: $tag / $numCtx already resolved from cache - go straight to launch
+}
+elseif ($LaunchOnly) {
     # ------------------------------------------------ launch-only short path --
+    try {
+        . (Join-Path $PSScriptRoot 'lib\hardware-scan.ps1')
+        . (Join-Path $PSScriptRoot 'lib\discover-model.ps1')
+        . (Join-Path $PSScriptRoot 'lib\ensure-prereqs.ps1')
+    }
+    catch {
+        Write-Host ('[ERROR] failed to load lib modules: ' + $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
     if (-not [string]::IsNullOrWhiteSpace($Model)) {
         $tag = $Model.Trim()
         Write-Host ('[LAUNCH-ONLY] model tag from -Model: ' + $tag)
@@ -259,6 +307,15 @@ if ($LaunchOnly) {
 }
 else {
     # ------------------------------------------------------- prerequisites --
+    try {
+        . (Join-Path $PSScriptRoot 'lib\hardware-scan.ps1')
+        . (Join-Path $PSScriptRoot 'lib\discover-model.ps1')
+        . (Join-Path $PSScriptRoot 'lib\ensure-prereqs.ps1')
+    }
+    catch {
+        Write-Host ('[ERROR] failed to load lib modules: ' + $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
     try {
         $prereq = Ensure-Prerequisites -AcceptInstalls
         Write-Host ('[PREREQ] ' + ($prereq | ConvertTo-Json -Compress -Depth 5))
@@ -435,6 +492,20 @@ else {
             Write-Host ('[ALIAS] warning: could not install shim: ' + $_.Exception.Message) -ForegroundColor Red
         }
     }
+
+    # ------------------------------------------------- cache bootstrap state --
+    # Successful full bootstrap: cache the chosen model so future launches take
+    # the fast path (interactive in well under one second). Refreshed by -Full.
+    try {
+        $numCtxOut = 0
+        if ($null -ne $numCtx) { $numCtxOut = [int]$numCtx }
+        $stateOut = @{ model = $tag; num_ctx = $numCtxOut; saved_at = (Get-Date -Format 'o') }
+        ($stateOut | ConvertTo-Json -Compress) | Set-Content -LiteralPath $stateFile -Encoding ASCII
+        Write-Host ('[STATE] bootstrap cached for fast launches: ' + $stateFile)
+    }
+    catch {
+        Write-Host ('[STATE] warning: could not cache bootstrap state: ' + $_.Exception.Message) -ForegroundColor Yellow
+    }
 }
 
 # ============================================================== LAUNCH =======
@@ -476,6 +547,7 @@ if ($null -ne $numCtx -and ([int]$numCtx) -gt 0) {
 
 Write-Host ''
 Write-Host ('[LAUNCH] ' + $pyExe + ' ' + ($launchArgs -join ' ')) -ForegroundColor Cyan
+Write-Host ('[READY] interactive mode starting - total startup ' + $sw.ElapsedMilliseconds + ' ms.') -ForegroundColor Green
 Write-Host ''
 
 $exitCode = 1
