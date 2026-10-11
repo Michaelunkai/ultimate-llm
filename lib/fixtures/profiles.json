@@ -1,0 +1,49 @@
+{
+  "profiles": {
+    "rtx5080-16gb": {
+      "generated_at": "2026-10-11T00:00:00Z",
+      "os": "Windows",
+      "powershell_version": "5.1",
+      "cpu": { "name": "AMD Ryzen 9 9950X", "cores": 16, "threads": 32 },
+      "ram_gb": 63.8,
+      "gpus": [
+        { "name": "NVIDIA GeForce RTX 5080", "vram_gb": 15.9, "source": "nvidia-smi" }
+      ],
+      "vram_total_gb": 15.9,
+      "disk_free_gb": 512.0,
+      "ollama_path": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+      "python_version": "3.12",
+      "winget_ok": true
+    },
+    "no-gpu-8gb": {
+      "generated_at": "2026-10-11T00:00:00Z",
+      "os": "Windows",
+      "powershell_version": "5.1",
+      "cpu": { "name": "Intel Core i5-10400", "cores": 6, "threads": 12 },
+      "ram_gb": 8,
+      "gpus": [
+        { "name": "none", "vram_gb": 0, "source": "none" }
+      ],
+      "vram_total_gb": 0,
+      "disk_free_gb": 120.0,
+      "ollama_path": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+      "python_version": "3.12",
+      "winget_ok": true
+    },
+    "weak-gpu-4gb": {
+      "generated_at": "2026-10-11T00:00:00Z",
+      "os": "Windows",
+      "powershell_version": "5.1",
+      "cpu": { "name": "Intel Core i7-9750H", "cores": 6, "threads": 12 },
+      "ram_gb": 16,
+      "gpus": [
+        { "name": "NVIDIA GeForce GTX 1650", "vram_gb": 4.0, "source": "nvidia-smi" }
+      ],
+      "vram_total_gb": 4.0,
+      "disk_free_gb": 256.0,
+      "ollama_path": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+      "python_version": "3.12",
+      "winget_ok": true
+    }
+  }
+}
