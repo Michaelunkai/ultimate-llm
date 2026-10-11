@@ -30,6 +30,7 @@ $stateFile = Join-Path $PSScriptRoot '.bootstrap-state.json'
 $venvPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 $harnessFile = Join-Path $PSScriptRoot 'harness\harness.py'
 $fastLaunch = $false
+$state = $null
 
 # ------------------------------------------------------------------ banner --
 Write-Host ''
@@ -251,6 +252,9 @@ if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offli
         $tag = [string]$state.model
         try { $numCtx = [int]$state.num_ctx } catch { $numCtx = 0 }
         $fastLaunch = $true
+        try {
+            if ($null -ne $state.hw) { $env:ULTIMATEAI_HW = ($state.hw | ConvertTo-Json -Compress) }
+        } catch { }
         # Warm the model in the background (detached; 60-minute keep-alive) so the
         # very first message does not wait for the weights to load.
         try {
@@ -499,7 +503,19 @@ else {
     try {
         $numCtxOut = 0
         if ($null -ne $numCtx) { $numCtxOut = [int]$numCtx }
-        $stateOut = @{ model = $tag; num_ctx = $numCtxOut; saved_at = (Get-Date -Format 'o') }
+        $hwOut = $null
+        try {
+            if ($null -ne $hw) {
+                $firstGpu = $hw.gpus | Select-Object -First 1
+                $hwOut = @{
+                    gpu = [string]$firstGpu.name
+                    vram_gb = [double]$hw.vram_total_gb
+                    ram_gb = [double]$hw.ram_gb
+                    cpu = [string]$hw.cpu.name
+                }
+            }
+        } catch { $hwOut = $null }
+        $stateOut = @{ model = $tag; num_ctx = $numCtxOut; hw = $hwOut; saved_at = (Get-Date -Format 'o') }
         ($stateOut | ConvertTo-Json -Compress) | Set-Content -LiteralPath $stateFile -Encoding ASCII
         Write-Host ('[STATE] bootstrap cached for fast launches: ' + $stateFile)
     }
@@ -509,6 +525,23 @@ else {
 }
 
 # ============================================================== LAUNCH =======
+if (-not $env:ULTIMATEAI_HW) {
+    try {
+        if ($null -ne $state -and $null -ne $state.hw) {
+            $env:ULTIMATEAI_HW = ($state.hw | ConvertTo-Json -Compress)
+        }
+        elseif (-not $fastLaunch) {
+            $hwL = Get-HardwareProfile
+            $firstGpuL = $hwL.gpus | Select-Object -First 1
+            $env:ULTIMATEAI_HW = (@{
+                gpu = [string]$firstGpuL.name
+                vram_gb = [double]$hwL.vram_total_gb
+                ram_gb = [double]$hwL.ram_gb
+                cpu = [string]$hwL.cpu.name
+            } | ConvertTo-Json -Compress)
+        }
+    } catch { }
+}
 $pyExe = ''
 $pyPre = @()
 if (Test-Path -LiteralPath $venvPython) {

@@ -105,7 +105,7 @@ def check_m03(ev):
         return ev.append("missing texttools/__init__.py")
     if not exists(t):
         return ev.append("missing tests/test_texttools.py")
-    n_assert = len(re.findall(r"\bassert\w*\s*\(", read(t), re.M))
+    n_assert = len(re.findall(r"\bassert\b|\bassert\w*\s*\(", read(t), re.M))
     ev.append(f"assert count = {n_assert} (need >= 8)")
     r = subprocess.run([PY, "tests/test_texttools.py"], cwd=proj, capture_output=True, text=True, timeout=60)
     ev.append(f"python tests/test_texttools.py -> exit {r.returncode}")

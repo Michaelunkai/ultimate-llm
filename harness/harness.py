@@ -104,6 +104,11 @@ SESSIONS_DIR = UAI_DIR / "sessions"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
+# Verified machine facts passed by Start-UltimateAI.ps1 (survives fast launches).
+# The system prompt injects these as GROUND TRUTH so the model can never misreport
+# the hardware (WMI AdapterRAM is 32-bit and wrong for GPUs bigger than 4 GB).
+HW_GROUND_TRUTH = os.environ.get("ULTIMATEAI_HW", "").strip()
+
 
 def _browser_headers():
     return {
@@ -172,16 +177,18 @@ class Heartbeat:
         "on it",
     ]
 
-    def __init__(self, console: "Console", interval: float = 3.0, action=None):
+    def __init__(self, console: "Console", interval: float = 3.0, action=None, schedule=None):
         self.console = console
         self.interval = interval
-        self.action = action  # callable(line_text) or None -> console.print
+        self.schedule = list(schedule) if schedule else None
+        self.action = action  # callable(line_text) or None -> console print
         self._stop = threading.Event()
         self._thread = None
         self._n = 0
         self._phase = ""
         self._detail = ""
         self._t0 = 0.0
+        self._i = 0
         self._lock = threading.Lock()
 
     def start(self, phase: str, detail: str = "") -> None:
@@ -230,7 +237,7 @@ class Heartbeat:
         return line
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval):
+        while not self._stop.wait(self._next_delay()):
             line = self._compose()
             try:
                 if self.action is not None:
@@ -244,6 +251,13 @@ class Heartbeat:
                     print(line, file=(self.console.file or sys.stdout), flush=True)
             except Exception:
                 pass
+
+    def _next_delay(self) -> float:
+        if not self.schedule:
+            return self.interval
+        delay = self.schedule[min(self._i, len(self.schedule) - 1)]
+        self._i += 1
+        return delay
 
 
 def _read_text_fallback(path: Path, max_bytes=None) -> str:
@@ -1619,6 +1633,23 @@ def build_system_prompt(override_path=None) -> str:
         f"Today's date: {now:%Y-%m-%d} ({now:%A})\n"
         f"Working directory: {STATE['cwd']}\n"
         f"OS: {platform.platform()} | Python {platform.python_version()} | Ollama host: {STATE['host']}\n"
+        + (
+            "\nGROUND TRUTH ABOUT THIS MACHINE (authoritative - NEVER contradict these facts and NEVER\n"
+            "misreport the hardware; WMI AdapterRAM is 32-bit and WRONG for GPUs larger than 4 GB - use\n"
+            "these verified facts, or live nvidia-smi output, for any hardware claim):\n"
+            + HW_GROUND_TRUTH
+            + "\n"
+            if HW_GROUND_TRUTH
+            else ""
+        )
+        + "\n"
+        "BEHAVIOR CONTRACT:\n"
+        "- NEVER argue with, question, or push back on the user's request. Execute it immediately and\n"
+        "  completely; if something is genuinely impossible, say exactly what you need in one line and\n"
+        "  try the closest achievable alternative anyway.\n"
+        "- NEVER stop before the goal is achieved and verified - work through every error.\n"
+        "- ANSWER STYLE: every answer must be beautifully readable for a human - a short lead line first,\n"
+        "  then markdown headings/tables/bullets, bold the key facts, no raw dumps unless asked.\n"
         "\n"
         "MANDATE: Never stop until the user's goal is fully done. Use tools proactively instead of asking\n"
         "questions. Verify your own work (re-read files, re-run commands, run tests) before claiming success.\n"
@@ -1794,14 +1825,17 @@ class ChatError(RuntimeError):
 def chat_stream(console: Console):
     """Stream one assistant turn from Ollama POST {host}/api/chat (NDJSON).
 
-    Returns (content, tool_calls). Content deltas are rendered live via a
-    transient rich Live preview; tool_call fragments are merged by the
-    ToolCallAssembler.
+    Returns (content, tool_calls). NO rich Live is used: Live redraws on a timer
+    and forces Windows Terminal to scroll back to the bottom while the user is
+    reading. Instead the Heartbeat prints sparse dim beat lines (5s then every
+    15s on a terminal, every 3s when piped), and the caller renders the finished
+    answer as full Markdown.
     """
     payload = {
         "model": STATE["model"],
         "messages": STATE["messages"],
         "stream": True,
+        "keep_alive": "1h",
         "tools": ollama_tools_schema(),
     }
     if STATE.get("num_ctx"):
@@ -1809,27 +1843,15 @@ def chat_stream(console: Console):
     url = STATE["host"].rstrip("/") + "/api/chat"
     assembler = ToolCallAssembler()
     parts = []
-    last_render = 0.0
+    think_parts = []
     think_chars = [0]
-
-    def _status_text() -> str:
-        streamed = sum(len(p) for p in parts)
-        bits = [f"STEP streaming • {streamed} chars"]
-        if think_chars[0]:
-            bits.append(f"{think_chars[0]} reasoning chars")
-        bits.append(fmt_ts())
-        return " • ".join(bits)
-
-    def _render_preview() -> Group:
-        status = Text(_status_text(), style="dim")
-        return Group(status, Markdown("".join(parts)[-6000:]))
+    schedule = (3.0,) if not console.is_terminal else (5.0, 15.0)
 
     try:
         # The heartbeat must cover the WHOLE request: queue + prompt prefill
         # (which can take a minute+ on long conversations before the first
-        # token) + streaming. It prints lines until the Live opens, then
-        # switches to refreshing the Live status line in place.
-        hb = Heartbeat(console, interval=3.0)
+        # token) + streaming.
+        hb = Heartbeat(console, schedule=schedule)
         hb.start("model working (queue + prefill + streaming)", f"model {STATE['model']}")
         try:
             with _httpx().Client(timeout=_httpx().Timeout(180.0, connect=10.0)) as client:
@@ -1837,37 +1859,36 @@ def chat_stream(console: Console):
                     if resp.status_code != 200:
                         detail = resp.read().decode("utf-8", errors="replace")[:400]
                         raise ChatError(f"HTTP {resp.status_code} from {url}: {detail}")
-                    with Live(console=console, refresh_per_second=4, transient=True) as live:
-                        if console.is_terminal:
-                            hb.action = lambda _line: live.update(_render_preview())
-                        hb.update(f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far")
-                        for line in resp.iter_lines():
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                obj = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if obj.get("error"):
-                                raise ChatError(str(obj["error"]))
-                            message = obj.get("message") or {}
-                            think = message.get("thinking") or ""
-                            if think:
-                                think_chars[0] += len(think)
-                                hb.update(f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far")
-                            delta = message.get("content") or ""
-                            if delta:
-                                parts.append(delta)
-                                hb.update(f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far")
-                                now = time.monotonic()
-                                if now - last_render >= 0.3:
-                                    live.update(_render_preview())
-                                    last_render = now
-                            if message.get("tool_calls"):
-                                assembler.feed(message)
-                            if obj.get("done"):
-                                break
+                    for line in resp.iter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if obj.get("error"):
+                            raise ChatError(str(obj["error"]))
+                        message = obj.get("message") or {}
+                        think = message.get("thinking") or ""
+                        if think:
+                            think_parts.append(think)
+                            think_chars[0] += len(think)
+                        delta = message.get("content") or ""
+                        if delta:
+                            parts.append(delta)
+                        if think or delta:
+                            hb.update(
+                                f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far"
+                            )
+                        if message.get("tool_calls"):
+                            assembler.feed(message)
+                        if obj.get("done"):
+                            # Real context size from the server -> drives compaction.
+                            pec = obj.get("prompt_eval_count")
+                            if pec:
+                                STATE["ctx_tokens"] = int(pec)
+                            break
         finally:
             hb.stop()
     except _httpx().ConnectError as exc:
@@ -1876,6 +1897,11 @@ def chat_stream(console: Console):
         raise ConnectionError(f"connection to Ollama at {STATE['host']} timed out ({exc})") from exc
     except _httpx().TransportError as exc:
         raise ConnectionError(f"Ollama connection dropped ({exc})") from exc
+    think_text = "".join(think_parts)
+    if think_text:
+        # gpt-oss needs its past chain-of-thought round-tripped on tool-loop
+        # follow-up requests or accuracy degrades each turn (scout finding).
+        STATE["last_thinking"] = think_text
     return "".join(parts), assembler.finalize()
 
 
@@ -1922,7 +1948,7 @@ def describe_tool_activity(name: str, args) -> str:
     if name == "find_files":
         return f"finding files matching '{_arg_str(args, 'pattern')}' under {_arg_str(args, 'root')}"
     if name in ("read_file", "write_file", "edit_file"):
-        return f"{name.split('_')[0]}ing file {_arg_str(args, 'path')}"
+        return {"read_file": "reading file", "write_file": "writing file", "edit_file": "editing file"}.get(name, f"processing {name}") + f" {_arg_str(args, 'path')}"
     if name == "list_dir":
         return f"listing directory {_arg_str(args, 'path')}"
     if name == "screenshot":
@@ -1959,7 +1985,7 @@ TOOL_ERROR_HINTS = {
 
 def execute_tool_with_progress(console: "Console", name: str, args):
     """Execute a tool with a guaranteed ≤4s heartbeat of plain-English progress."""
-    hb = Heartbeat(console, interval=3.0)
+    hb = Heartbeat(console, schedule=(3.0,) if not console.is_terminal else (15.0,))
     hb.start(f"tool {name}", describe_tool_activity(name, args))
     t0 = time.monotonic()
     try:
@@ -2116,6 +2142,192 @@ def save_session() -> None:
         pass  # crash-safe: persistence must never kill the loop
 
 
+# --- Input history + line editor (Up/Down = prompts from ALL sessions) ----------
+
+
+HISTORY_FILE = UAI_DIR / "history.log"
+
+
+def load_history() -> list:
+    """All prompts ever submitted, oldest first (one per line)."""
+    try:
+        if HISTORY_FILE.exists():
+            return [
+                line.rstrip("\n")
+                for line in HISTORY_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip()
+            ]
+    except Exception:
+        pass
+    return []
+
+
+def append_history(text: str) -> None:
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_FILE, "a", encoding="utf-8") as fh:
+            fh.write(text.replace("\n", " ").strip() + "\n")
+    except Exception:
+        pass
+
+
+def _editor_redraw(prompt_str: str, buf: list, cursor: int) -> None:
+    sys.stdout.write("\r\x1b[K" + prompt_str + "".join(buf))
+    over = len(buf) - cursor
+    if over > 0:
+        sys.stdout.write("\x1b[" + str(over) + "D")
+    sys.stdout.flush()
+
+
+def prompt_with_history(prompt_str: str, history: list) -> str:
+    """Interactive single-line input with Up/Down history navigation across ALL
+    sessions (newest first; Down past the newest restores the draft). Requires
+    a real console (msvcrt); callers fall back to console.input otherwise.
+    Raises KeyboardInterrupt on Ctrl+C."""
+    import msvcrt  # Windows-only, imported lazily
+
+    sys.stdout.write(prompt_str)
+    sys.stdout.flush()
+    buf: list = []
+    cur = 0
+    hpos = len(history)
+    draft: list = []
+
+    def redraw():
+        _editor_redraw(prompt_str, buf, cur)
+
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "".join(buf)
+        if ch == "\x03":  # Ctrl+C
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            raise KeyboardInterrupt
+        if ch == "\x08":  # Backspace
+            if cur > 0:
+                del buf[cur - 1]
+                cur -= 1
+                redraw()
+            continue
+        if ch in ("\x00", "\xe0"):  # Windows special-key prefix
+            nxt = msvcrt.getwch()
+            if nxt == "H":  # Up: older prompt
+                if history and hpos > 0:
+                    if hpos == len(history):
+                        draft = list(buf)
+                    hpos -= 1
+                    buf = list(history[hpos])
+                    cur = len(buf)
+                    redraw()
+            elif nxt == "P":  # Down: newer prompt / draft
+                if hpos < len(history):
+                    hpos += 1
+                    buf = list(draft if hpos == len(history) else history[hpos])
+                    cur = len(buf)
+                    redraw()
+            elif nxt == "K" and cur > 0:  # Left
+                cur -= 1
+                redraw()
+            elif nxt == "M" and cur < len(buf):  # Right
+                cur += 1
+                redraw()
+            elif nxt == "G":  # Home
+                cur = 0
+                redraw()
+            elif nxt == "O":  # End
+                cur = len(buf)
+                redraw()
+            elif nxt == "S" and cur < len(buf):  # Delete
+                del buf[cur]
+                redraw()
+            continue
+        if ch >= " ":
+            buf.insert(cur, ch)
+            cur += 1
+            redraw()
+        # other control characters are ignored
+
+
+# --- Context compaction (infinite session memory) --------------------------------
+
+
+def estimate_tokens(messages) -> int:
+    return int(sum(len(str(m.get("content", ""))) for m in messages) / 3.5)
+
+
+def compact_history(console: "Console", force: bool = False) -> bool:
+    """Summarize older turns into a rolling context summary so the session can
+    run forever inside a fixed context window. Returns True if compaction ran."""
+    msgs = STATE["messages"]
+    est = STATE.get("ctx_tokens") or estimate_tokens(msgs)
+    if not force and est < 22000:
+        return False
+    if len(msgs) < 12:
+        return False
+    keep = 8
+    cut = len(msgs) - keep
+    # Atomic boundary: an assistant tool_call message and its tool results must
+    # never be separated (causes API errors). Move the cut until it lands on a
+    # non-tool message.
+    while cut < len(msgs) and str(msgs[cut].get("role")) == "tool":
+        cut += 1
+    old = msgs[1:cut]
+    if len(old) < 4:
+        return False
+    transcript = "\n".join(
+        f"[{m.get('role')}]: {str(m.get('content', ''))[:400]}" for m in old
+    )[:60000]
+    console.print(f"[yellow](context compaction: ~{est} tokens - summarizing {len(old)} older messages...)[/]")
+    hb = Heartbeat(console, schedule=(3.0,) if not console.is_terminal else (15.0,))
+    hb.start("compacting session memory")
+    try:
+        payload = {
+            "model": STATE["model"],
+            "stream": False,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You compress agent conversation history into a dense CONTEXT SUMMARY. Preserve: "
+                        "the user's goals and preferences, every file path created or modified, key "
+                        "decisions, important results and numbers, and open threads. Under 800 words."
+                    ),
+                },
+                {"role": "user", "content": "Summarize this agent conversation history:\n\n" + transcript},
+            ],
+        }
+        with _httpx().Client(timeout=_httpx().Timeout(300.0, connect=10.0)) as client:
+            resp = client.post(STATE["host"].rstrip("/") + "/api/chat", json=payload)
+        resp.raise_for_status()
+        summary = str(resp.json().get("message", {}).get("content", "")).strip()
+    except Exception as exc:
+        console.print(f"[red](compaction failed: {str(exc)[:140]} - continuing without compaction)[/]")
+        return False
+    finally:
+        hb.stop()
+    if not summary:
+        return False
+    system_msg = msgs[0]
+    recent = msgs[cut:]
+    STATE["messages"] = [
+        system_msg,
+        {
+            "role": "user",
+            "content": "(context summary of everything earlier in this session - treat as memory:\n" + summary + ")",
+        },
+        {"role": "assistant", "content": "Understood - I retain full context of our earlier work in this session."},
+        *recent,
+    ]
+    save_session()
+    console.print(
+        f"[green](context compacted: {len(old)} messages -> rolling summary; next turns run with a clean window)[/]"
+    )
+    return True
+
+
 # --- Agent loop --------------------------------------------------------------------
 
 
@@ -2129,6 +2341,8 @@ def run_agent_turn(user_input: str, args) -> None:
     tool_errors = 0
     try:
         for _iteration in range(1, max(1, args.max_iters) + 1):
+            if (STATE.get("ctx_tokens") or estimate_tokens(STATE["messages"])) > 22000:
+                compact_history(console)
             console.print(
                 f"[bold cyan]── STEP {_iteration}[/] [dim]• {fmt_ts()} • elapsed {fmt_elapsed()} • thinking + streaming…[/]"
             )
@@ -2179,6 +2393,11 @@ def run_agent_turn(user_input: str, args) -> None:
             STATE["conn_retries"] = 0
 
             assistant_msg = {"role": "assistant", "content": content}
+            # Round-trip the model's own reasoning on tool-loop follow-ups
+            # (gpt-oss accuracy degrades without it - scout finding).
+            think_back = STATE.pop("last_thinking", None)
+            if think_back:
+                assistant_msg["thinking"] = think_back
             if tool_calls:
                 assistant_msg["tool_calls"] = [
                     {"function": {"name": tc["name"], "arguments": tc["arguments"]}} for tc in tool_calls
@@ -2219,7 +2438,9 @@ def run_agent_turn(user_input: str, args) -> None:
                                         "files, re-check every number and name. IMPORTANT: verify by INSPECTING "
                                         "(read files, count entries, check state) - do NOT re-run actions with "
                                         "side effects (running a script again can create duplicate outputs and "
-                                        "break the mission's own invariants); if you already produced the "
+                                        "break the mission's own invariants). Explicitly re-count anything the mission states as an EXACT "
+                                        "number (exactly one folder, exactly N files) and delete duplicates before confirming. "
+                                        "If you already produced the "
                                         "artifacts, inspect them as they are. If ANYTHING is missing or wrong, "
                                         "fix it and then call task_done again. If everything truly passes, call "
                                         "task_done again to confirm.)"
@@ -2274,7 +2495,9 @@ def run_agent_turn(user_input: str, args) -> None:
                                     "files, re-check every number and name. IMPORTANT: verify by INSPECTING "
                                     "(read files, count entries, check state) - do NOT re-run actions with "
                                     "side effects (running a script again can create duplicate outputs and "
-                                    "break the mission's own invariants); if you already produced the "
+                                    "break the mission's own invariants). Explicitly re-count anything the mission states as an EXACT "
+                                        "number (exactly one folder, exactly N files) and delete duplicates before confirming. "
+                                        "If you already produced the "
                                     "artifacts, inspect them as they are. If ANYTHING is missing or wrong, "
                                     "fix it and then call task_done again. If everything truly passes, call "
                                     "task_done again to confirm.)"
@@ -2515,12 +2738,26 @@ def main(argv=None) -> int:
             return 4
         return 0
 
-    console.print("[dim]Type your goal and press Enter. Commands: /tools  /model <tag>  /reset  /save  /exit[/]")
+    interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+    if interactive:
+        try:
+            import msvcrt  # noqa: F401 - enables the Up/Down history editor
+            os.system("")  # enable ANSI/VT escape sequences in classic conhost
+        except ImportError:
+            interactive = False
+    console.print(
+        "[dim]Type your goal and press Enter. Commands: /help /new /sessions /history /stats /research "
+        "/compact /model /tools /save /reset /cwd /exit  |  Up/Down = prompt history from ALL sessions[/]"
+    )
     save_session()
+    history = load_history()
 
     while True:
         try:
-            user_input = console.input("[bold magenta]\u276f [/bold magenta]")
+            if interactive:
+                user_input = prompt_with_history("\u276f ", history)
+            else:
+                user_input = console.input("[bold magenta]\u276f [/bold magenta]")
         except EOFError:
             break
         except KeyboardInterrupt:
@@ -2530,14 +2767,130 @@ def main(argv=None) -> int:
         if not user_input:
             continue
 
-        if user_input in ("/exit", "/quit"):
+        low = user_input.lower()
+        if low in ("/exit", "/quit"):
             break
-        if user_input == "/reset":
+
+        if low == "/help":
+            console.print(
+                Panel(
+                    "[bold]/new[/] start a fresh session · [bold]/sessions[/] list saved sessions · "
+                    "[bold]/sessions <n>[/] load session n · [bold]/history[/] recent prompts (all sessions)\n"
+                    "[bold]/stats[/] model + machine + session stats · [bold]/research <topic>[/] headless web "
+                    "research · [bold]/compact[/] compress session memory now\n"
+                    "[bold]/model <tag>[/] switch model · [bold]/tools[/] tool list · [bold]/save[/] save session · "
+                    "[bold]/reset[/] or [bold]/clear[/] clear conversation · [bold]/cwd <dir>[/] set working "
+                    "directory · [bold]/exit[/] or [bold]/quit[/] leave\n"
+                    "[dim]Up/Down arrows recall prompts from all past sessions, newest first.[/]",
+                    title="COMMANDS",
+                    border_style="cyan",
+                )
+            )
+            continue
+
+        if low in ("/reset", "/clear"):
             STATE["messages"] = [STATE["messages"][0]]
+            STATE["done_confirmed"] = False
             save_session()
             console.print("[yellow]Conversation reset (system prompt kept).[/]")
             continue
-        if user_input == "/save":
+
+        if low == "/new":
+            STATE["messages"] = [STATE["messages"][0]]
+            STATE["done_confirmed"] = False
+            STATE["session_file"] = UAI_DIR / "sessions" / (datetime.now().strftime("%Y%m%d-%H%M%S") + ".json")
+            STATE["session_file"].parent.mkdir(parents=True, exist_ok=True)
+            save_session()
+            console.print(f"[green]New session started:[/] {STATE['session_file'].name}")
+            continue
+
+        if low == "/sessions":
+            files = sorted(UAI_DIR.glob("sessions/*.json"))
+            if not files:
+                console.print("[yellow]No saved sessions yet.[/]")
+                continue
+            for i, f in enumerate(files, 1):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+                    n = len(data.get("messages", []))
+                    first = next(
+                        (str(m.get("content", ""))[:70] for m in data.get("messages", []) if m.get("role") == "user"),
+                        "",
+                    )
+                except Exception:
+                    n, first = 0, "(unreadable)"
+                mark = " [green](loaded)[/]" if f == STATE.get("session_file") else ""
+                console.print(f"  {i:>2}. {f.name}  ·  {n} msgs  ·  {first}{mark}")
+            console.print("[dim]Load one with /sessions <number>[/]")
+            continue
+
+        if low.startswith("/sessions"):
+            parts = user_input.split(maxsplit=1)
+            files = sorted(UAI_DIR.glob("sessions/*.json"))
+            try:
+                pick = files[int(parts[1]) - 1]
+            except (IndexError, ValueError, OSError):
+                console.print("[yellow]usage: /sessions <number> (see /sessions)[/]")
+                continue
+            try:
+                data = json.loads(pick.read_text(encoding="utf-8", errors="replace"))
+                msgs = data.get("messages", [])
+                if msgs and msgs[0].get("role") != "system":
+                    msgs = [{"role": "system", "content": build_system_prompt()}, *msgs]
+                STATE["messages"] = msgs
+                STATE["session_file"] = pick
+                console.print(f"[green]Loaded {pick.name} ({len(msgs)} messages).[/]")
+            except Exception as exc:
+                console.print(f"[red]Could not load session: {exc}[/]")
+            continue
+
+        if low == "/history":
+            for i, h in enumerate(history[-25:], 1):
+                console.print(f"  {i:>3}. {h[:110]}")
+            continue
+
+        if low == "/stats":
+            hw = HW_GROUND_TRUTH or "(not provided - set by the launcher)"
+            console.print(
+                Panel(
+                    f"[bold]model[/]: {STATE['model']}\n"
+                    f"[bold]host [/]: {STATE['host']}  ·  context window: {STATE.get('num_ctx') or 'model default'}\n"
+                    f"[bold]ctx tokens used (last request)[/]: {STATE.get('ctx_tokens') or 'n/a'}\n"
+                    f"[bold]messages in session[/]: {len(STATE['messages'])}\n"
+                    f"[bold]cwd[/]: {STATE['cwd']}\n"
+                    f"[bold]machine (ground truth)[/]: {hw}",
+                    title="SESSION STATS",
+                    border_style="cyan",
+                )
+            )
+            continue
+
+        if low.startswith("/research"):
+            topic = user_input.split(maxsplit=1)[1].strip() if len(user_input.split(maxsplit=1)) > 1 else ""
+            if not topic:
+                console.print("[yellow]usage: /research <topic>[/]")
+                continue
+            result, dur = execute_tool_with_progress(console, "web_research", {"query": topic})
+            console.print(Markdown(result))
+            continue
+
+        if low == "/compact":
+            if compact_history(console, force=True):
+                console.print("[green]Session memory compacted.[/]")
+            else:
+                console.print("[yellow]Nothing to compact yet (session still small).[/]")
+            continue
+
+        if low.startswith("/cwd"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) == 2 and Path(parts[1].strip()).is_dir():
+                STATE["cwd"] = str(Path(parts[1].strip()).resolve())
+                console.print(f"[green]Working directory set to {STATE['cwd']}[/]")
+            else:
+                console.print(f"[yellow]Current cwd: {STATE['cwd']}  (usage: /cwd <directory>)[/]")
+            continue
+
+        if low == "/save":
             save_session()
             target = STATE.get("session_file") or "(no session file)"
             console.print(f"[green]Session saved:[/] {target}")
@@ -2554,6 +2907,8 @@ def main(argv=None) -> int:
                 console.print(f"[yellow]Current model: {STATE['model']} (usage: /model <tag>)[/]")
             continue
 
+        append_history(user_input)
+        history.append(user_input)
         try:
             run_agent_turn(user_input, args)
         except SystemExit:
