@@ -156,3 +156,21 @@ recomputed and matched). Logs: `missions\logs\`.
 - Ollama HTTP 500 tool-call parse errors auto-retry with fresh sampling.
 - System prompt enforces absolute paths, exact filenames, exact verification commands,
   checklist discipline, and scope isolation (git work only inside mission sandboxes).
+
+## Sub-second launches (fast path)
+
+After the first successful bootstrap, `Ultimate-AI.cmd` caches its decisions in
+`.bootstrap-state.json` and takes a fast path: model discovery, prerequisite probes and
+pip checks are skipped entirely, the chosen model is warmed in the background (detached,
+60-minute keep-alive, full 32K context on GPU), and the interactive REPL opens immediately.
+
+Measured on this machine (double-click to usable prompt): **10/10 launches under one
+second, max 558 ms** (previously ~10 s). Startup time is printed on every launch in the
+`[READY] ... total startup NNN ms` line.
+
+- `-Full` - redo the complete bootstrap (re-discover the best model online, re-check
+  prerequisites, refresh the cache). Use it after hardware changes or whenever you want
+  the newest model of the day; every normal launch afterwards is instant again.
+- If the cached model was deleted (`ollama rm <tag>`), re-run once with `-Full`.
+- First-ever run still does the full setup (installs, multi-GB model download) - that is
+  the one and only slow run.
