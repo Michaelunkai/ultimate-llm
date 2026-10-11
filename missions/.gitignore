@@ -1,5 +1,5 @@
-missions/M[0-9][0-9]/
-missions/logs/
+M[0-9][0-9]/
+logs/
 .venv/
 __pycache__/
 .bootstrap-state.json
