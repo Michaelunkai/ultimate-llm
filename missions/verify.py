@@ -93,6 +93,7 @@ def check_m02(ev):
         ev.append(f"report lacks BEST_PRODUCT {best_product}")
     if f"{total:.2f}" in txt and "200" in txt and top_region in txt and best_product in txt:
         ev.append("report numbers MATCH independent recompute")
+        ev.append("data analysis COMPLETE")
 
 
 # ---------------------------------------------------------------- M03
@@ -119,20 +120,27 @@ def check_m04(ev):
     repo = ROOT / "M04" / "repo"
     if not (repo / ".git").exists():
         return ev.append("no .git in M04/repo")
-    log = subprocess.run(["git", "-C", str(repo), "log", "--oneline"], capture_output=True, text=True)
+    log = subprocess.run(["git", "-C", str(repo), "log", "--oneline", "--all"], capture_output=True, text=True)
     commits = [l for l in log.stdout.splitlines() if l.strip()]
-    ev.append(f"commits = {len(commits)}")
+    ev.append(f"commits (--all) = {len(commits)} (need >= 4)")
+    cur = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    on_default = cur.stdout.strip() in ("main", "master")
+    n_default = 0
+    if on_default:
+        cnt = subprocess.run(["git", "-C", str(repo), "rev-list", "--count", "HEAD"], capture_output=True, text=True)
+        try:
+            n_default = int(cnt.stdout.strip())
+        except ValueError:
+            n_default = 0
+    ev.append(f"current branch = {cur.stdout.strip()}, commits on default = {n_default} (need 3)")
     br = subprocess.run(["git", "-C", str(repo), "branch", "--list"], capture_output=True, text=True)
     if "feature/experimental" not in br.stdout:
         ev.append("branch feature/experimental missing")
-    cur = subprocess.run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
-    ev.append(f"current branch = {cur.stdout.strip()}")
     feat = subprocess.run(["git", "-C", str(repo), "show", "feature/experimental:feature.txt"],
                           capture_output=True, text=True)
     if feat.returncode != 0:
         ev.append("feature.txt missing on feature/experimental")
-    if len(commits) >= 4 and "feature/experimental" in br.stdout and feat.returncode == 0 \
-            and cur.stdout.strip() in ("main", "master"):
+    if len(commits) >= 4 and on_default and n_default == 3 and "feature/experimental" in br.stdout and feat.returncode == 0:
         ev.append("git workflow COMPLETE")
 
 
@@ -152,9 +160,15 @@ def check_m05(ev):
         ev.append("GPU 5080 not found in report")
     if "microsoft windows" not in low:
         ev.append("OS caption missing")
-    ram_ok = any(90 <= n <= 98 for n in re.findall(r"(\d{2,3}(?:[.,]\d+)?)\s*gb", low))
+    ram_ok = False
+    for line in low.splitlines():
+        if "ram" in line or "memory" in line:
+            for x in re.findall(r"(\d{2,4}(?:[.,]\d+)?)", line):
+                val = float(x.replace(",", "."))
+                if 90 <= val <= 98:
+                    ram_ok = True
     if not ram_ok:
-        ev.append("no plausible total-RAM GB value (90-98) in report")
+        ev.append("no plausible total-RAM value (90-98 GB) on a RAM/memory line in report")
     c = read(chart)
     pct = re.findall(r"(\d{1,3})\s*%", c)
     bars = len(re.findall(r"[#=*█■]+", c))
@@ -276,15 +290,16 @@ def check_m10(ev):
         return ev.append("missing research_summary.md")
     txt = read(f)
     low = txt.lower()
-    if "illustrative examples" not in low:
-        ev.append("missing fact from example.com ('illustrative examples')")
+    if "illustrative examples" not in low and "documentation examples" not in low:
+        ev.append("missing fact from example.com ('illustrative/documentation examples')")
     if "reserved" not in low and "set aside" not in low:
         ev.append("missing fact from iana.org ('reserved'/'set aside')")
     urls = re.findall(r"https?://\S+", txt)
     ev.append(f"URLs = {len(urls)} (need >= 2)")
     words = len(txt.split())
     ev.append(f"words = {words} (need >= 150)")
-    if "illustrative examples" in low and ("reserved" in low or "set aside" in low) and len(urls) >= 2 and words >= 150:
+    if ("illustrative examples" in low or "documentation examples" in low) \
+            and ("reserved" in low or "set aside" in low) and len(urls) >= 2 and words >= 150:
         ev.append("web research COMPLETE")
 
 

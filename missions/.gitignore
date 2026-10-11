@@ -1,0 +1,4 @@
+missions/M[0-9][0-9]/
+missions/logs/
+.venv/
+__pycache__/

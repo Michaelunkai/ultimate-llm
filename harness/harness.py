@@ -146,7 +146,7 @@ def _run_captured(cmd, timeout_s: float, shell: bool = False) -> str:
     except OSError as exc:
         return f"ERROR: {exc}"
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return (out or "(no output)") + f"\n[exit code: {proc.returncode}]"
+    return f"[cwd: {STATE['cwd']}]\n" + (out or "(no output)") + f"\n[exit code: {proc.returncode}]"
 
 
 def register_tool(name: str, description: str, parameters: dict):
@@ -1161,7 +1161,9 @@ def tool_memory_write(args: dict) -> str:
     },
 )
 def tool_task_done(args: dict) -> str:
-    summary = str(args.get("summary", "") or "done")
+    summary = str(args.get("summary", "") or "").strip()
+    if not summary or summary.lower() in ("done", "complete", "finished"):
+        return "ERROR: task_done rejected - provide a real summary stating what was accomplished and verified"
     STATE["done"] = True
     return summary
 
@@ -1220,10 +1222,31 @@ def build_system_prompt(override_path=None) -> str:
         "AVAILABLE TOOLS:\n"
         f"{tool_docs}"
         "\n\n"
-        "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files you\n"
-        "wrote, re-run scripts you created, check outputs match every stated requirement, and fix any gap found.\n"
-        "A task is complete only when your own verification passes. Your task_done summary must briefly state what\n"
-        "you verified and how."
+        "CRITICAL OPERATION RULES (violating any of these = mission failure):\n"
+        "1. ALWAYS use absolute paths (e.g. F:\\study\\AI_ML\\LocalAI\\ultimate-llm\\missions\\M02\\data\\file.csv) -\n"
+        "   in every tool call AND inside every script you write. Relative paths resolve to an unexpected\n"
+        "   working directory and silently create files in the wrong place.\n"
+        "2. A tool result containing ERROR is a failure you must fix and retry. Never ignore an error; never\n"
+        "   report success while any error is unresolved.\n"
+        "3. Use the EXACT file names, folder names and output names the mission specifies. Never invent\n"
+        "   variants (report.md is not report_final.md; solutions.txt is not solutions_clean.txt).\n"
+        "4. Verify using the EXACT command and working directory the mission requires. A different command\n"
+        "   that looks equivalent does not count as verification.\n"
+        "5. run_powershell and run_cmd already execute inside PowerShell/cmd: pass raw commands directly.\n"
+        "   Never wrap them in another powershell -Command / cmd /c layer.\n"
+        "6. A plain text reply without a tool call is treated as idle: keep making tool calls until the goal\n"
+        "   is fully done, then call task_done.\n"
+        "7. CHECKLIST DISCIPLINE: treat every numbered requirement in the mission as a hard checklist item.\n"
+        "   Before task_done, walk through the mission requirement by requirement and verify EACH one with a\n"
+        "   tool call (count the files, check each number, confirm each name). If any item is unmet, fix it\n"
+        "   first - partial completion is failure.\n"
+        "8. When a tool call fails to parse or errors repeatedly while writing long content, write the file\n"
+        "   in smaller pieces or via run_python instead of one huge call, then re-read it to confirm.\n"
+        "\n"
+        "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files\n"
+        "you wrote, re-run scripts you created, check outputs match EVERY stated requirement (counts, sums,\n"
+        "names, formats), and fix any gap found. Call task_done ONLY when all of that passed; the summary\n"
+        "must briefly state what you verified and how."
     )
 
 
@@ -1392,6 +1415,8 @@ def chat_stream(console: Console):
         raise ConnectionError(f"cannot reach Ollama at {STATE['host']} ({exc})") from exc
     except httpx.ConnectTimeout as exc:
         raise ConnectionError(f"connection to Ollama at {STATE['host']} timed out ({exc})") from exc
+    except httpx.TransportError as exc:
+        raise ConnectionError(f"Ollama connection dropped ({exc})") from exc
     return "".join(parts), assembler.finalize()
 
 
@@ -1500,31 +1525,36 @@ def run_agent_turn(user_input: str, args) -> None:
             console.print(
                 f"[bold cyan]── STEP {_iteration}[/] [dim]• {fmt_ts()} • elapsed {fmt_elapsed()} • thinking + streaming…[/]"
             )
-            try:
-                content, tool_calls = chat_stream(console)
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Interrupted by user.[/]")
-                STATE["last_outcome"] = "interrupted"
-                return
-            except ConnectionError as exc:
-                console.print(
-                    Panel(
-                        "[bold red]Ollama is not reachable.[/]\n"
-                        f"Host: {STATE['host']}\n\n"
-                        "Start the Ollama server first, e.g.:\n"
-                        "    ollama serve\n"
-                        "or make sure the Ollama app is running, then re-run the harness.",
-                        title="CONNECT FAILED",
-                        border_style="red",
-                    )
-                )
-                STATE["last_outcome"] = "chat_error"
-                save_session()
-                raise SystemExit(2) from exc
-            except ChatError as exc:
-                console.print(Panel(f"[red]Chat error: {exc}[/]", title="ERROR", border_style="red"))
-                STATE["last_outcome"] = "chat_error"
-                return
+            chat_retries = 2
+            while True:
+                try:
+                    content, tool_calls = chat_stream(console)
+                    break
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]Interrupted by user.[/]")
+                    STATE["last_outcome"] = "interrupted"
+                    return
+                except ChatError as exc:
+                    chat_retries -= 1
+                    if chat_retries > 0:
+                        console.print(f"[yellow](chat error, retrying: {str(exc)[:140]}...)[/]")
+                        time.sleep(2.0)
+                        continue
+                    console.print(Panel(f"[red]Chat error: {exc}[/]", title="ERROR", border_style="red"))
+                    STATE["last_outcome"] = "chat_error"
+                    return
+                except ConnectionError as exc:
+                    conn_retries = STATE.get("conn_retries", 0)
+                    if conn_retries < 8:
+                        STATE["conn_retries"] = conn_retries + 1
+                        wait = min(45.0, 5.0 * (conn_retries + 1))
+                        console.print(f"[yellow](connection dropped - retrying in {wait:.0f}s: {str(exc)[:120]})[/]")
+                        time.sleep(wait)
+                        continue
+                    console.print(Panel(f"[red]Connection failed: {exc}[/]", title="ERROR", border_style="red"))
+                    STATE["last_outcome"] = "chat_error"
+                    return
+            STATE["conn_retries"] = 0
 
             assistant_msg = {"role": "assistant", "content": content}
             if tool_calls:
@@ -1553,7 +1583,7 @@ def run_agent_turn(user_input: str, args) -> None:
                         tool_errors += 1
                     display_tool_result(console, name, result, dur=dur)
                     STATE["messages"].append({"role": "tool", "content": result, "name": name})
-                    if name == "task_done":
+                    if name == "task_done" and not result.startswith("ERROR"):
                         done = True
                         done_summary = result
                 save_session()
@@ -1587,7 +1617,7 @@ def run_agent_turn(user_input: str, args) -> None:
                 display_tool_result(console, name, result, dur=dur)
                 STATE["messages"].append({"role": "tool", "content": result, "name": name})
                 save_session()
-                if name == "task_done":
+                if name == "task_done" and not str(result).startswith("ERROR"):
                     STATE["last_outcome"] = "done"
                     console.print(Panel(str(result)[:2000], title="TASK DONE", border_style="green"))
                     console.print(
@@ -1598,11 +1628,34 @@ def run_agent_turn(user_input: str, args) -> None:
                     return
                 continue
 
-            if content.strip():
-                console.print(Markdown(content))
-            else:
-                console.print("[dim](the model returned an empty response)[/]")
+            if not content.strip():
+                STATE["empty_streak"] = STATE.get("empty_streak", 0) + 1
+                if STATE["empty_streak"] <= 3:
+                    console.print("[yellow](empty response - nudging the agent to continue)[/]")
+                    STATE["messages"].append(
+                        {
+                            "role": "user",
+                            "content": "(system note: your last reply was empty. Continue the mission now with tool calls; do not stop until every requirement is met and verified.)",
+                        }
+                    )
+                    continue
+                console.print("[dim](the model returned an empty response too many times)[/]")
                 STATE["last_outcome"] = "empty"
+                return
+            STATE["empty_streak"] = 0
+            # Plain-text answer without task_done: nudge once, then accept and end.
+            console.print(Markdown(content))
+            if not STATE.get("done_nudged"):
+                STATE["done_nudged"] = True
+                console.print("[yellow](no task_done call detected - nudging the agent to confirm completion)[/]")
+                STATE["messages"].append(
+                    {
+                        "role": "user",
+                        "content": "(system note: you replied in plain text without calling task_done. If the mission is fully complete and verified, call task_done now with a summary. Otherwise keep working with tools.)",
+                    }
+                )
+                continue
+            STATE["last_outcome"] = "answered"
             return
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/]")
@@ -1777,7 +1830,7 @@ def main(argv=None) -> int:
             return 3
         if outcome == "chat_error":
             return 1
-        if outcome in ("interrupted", "empty"):
+        if outcome in ("interrupted", "empty", "answered"):
             console.print("[yellow]mission ended without task_done confirmation[/]")
             return 4
         return 0

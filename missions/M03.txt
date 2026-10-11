@@ -1,6 +1,6 @@
 MISSION 03 - Python package with passing test suite.
 Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M03\texttools-project\ create:
 1. texttools\__init__.py exporting three functions: count_words(text) (whitespace-split word count), reverse_string(text), is_palindrome(text) (true when the string reads the same backwards ignoring case, spaces and punctuation, e.g. "A man, a plan, a canal: Panama" is a palindrome).
-2. tests\test_texttools.py with AT LEAST 8 assert statements covering all three functions including the Panama example, empty strings, and a sentence for count_words. It must be runnable with plain "python tests\test_texttools.py" from the project root (exit code 0, print ALL TESTS PASSED).
+2. tests\test_texttools.py with AT LEAST 8 assert statements covering all three functions including the Panama example, empty strings, and a sentence for count_words. It must be runnable with plain "python tests\test_texttools.py" from the project root (exit code 0, print ALL TESTS PASSED). IMPORTANT: when Python runs a file directly, its own directory (tests\) is on sys.path but the project root is NOT - your test file must bootstrap this itself (e.g. sys.path.insert the parent directory computed from __file__) so the exact command above works. Verify THAT EXACT command from the project root before finishing.
 3. A README.md documenting the three functions.
 Run the test file yourself and confirm exit code 0 and the success line, then call task_done.
