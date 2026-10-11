@@ -125,3 +125,34 @@ ultimate-llm\
 │   └── requirements.txt       # Python dependencies (rich, httpx, psutil, ...)
 └── README.md                  # This file
 ```
+
+## Proving the agent: the mission battery
+
+The harness ships with a 12-mission proving battery in `missions\` (web dev, data
+analysis, package+tests, git workflow, system introspection, file organization,
+PowerShell automation, CLI tooling, N-Queens solving, live web research, desktop
+screenshot+clipboard, mini ETL). Every mission is given to the agent with ZERO human
+help and verified afterwards by an independent checker (`missions\verify.py`) that
+recomputes results from the artifacts on disk.
+
+- Run one mission: `python harness\harness.py --model gpt-oss:20b --num-ctx 32768 --yes --mission "@F:\study\AI_ML\LocalAI\ultimate-llm\missions\M01.txt"`
+- Verify: `python missions\verify.py M01` (or `ALL`)
+- Exit codes: `0` task confirmed complete, `3` max iterations, `4` ended without task_done, `1` connection/chat error.
+
+Real-time readability: every step prints a timestamped `STEP n` header, a live
+streaming preview with character counts and the clock, numbered `TOOL CALL #k` panels
+with execution durations, and a `TASK CONFIRMED COMPLETE` footer with started/finished
+times, total duration, steps and tool-call/error counts.
+
+Latest definitive sweep (this exact build): **12/12 missions PASSED**, plus mission 13
+run through `Ultimate-AI.cmd` itself (word-statistics tool, numbers independently
+recomputed and matched). Logs: `missions\logs\`.
+
+## Resilience features (added during proving)
+
+- Empty/idle model responses trigger nudges, then a full conversation restart with the
+  mission (partial work is inspected and continued) - up to 2 restarts.
+- Chat errors and dropped connections retry with backoff (up to 8 connection retries).
+- Ollama HTTP 500 tool-call parse errors auto-retry with fresh sampling.
+- System prompt enforces absolute paths, exact filenames, exact verification commands,
+  checklist discipline, and scope isolation (git work only inside mission sandboxes).
