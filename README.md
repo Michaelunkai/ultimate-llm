@@ -98,7 +98,7 @@ flowchart LR
 |---|---|
 | Shell & processes | `run_powershell` `run_cmd` `run_python` `start_process` `list_processes` `stop_process` |
 | Files | `read_file` `write_file` `edit_file` `list_dir` `find_files` `search_files` |
-| Web | `web_search` `fetch_url` `open_in_browser` |
+| Web (headless, no browser) | `web_research` `web_search` `fetch_url` `open_in_browser` (visual last resort) |
 | Desktop | `screenshot` `clipboard_get` `clipboard_set` `notify_user` |
 | Projects | `git_run` `scaffold_project` |
 | Memory & control | `memory_read` `memory_write` `task_done` |
@@ -107,6 +107,17 @@ The agent auto-approves everything (no confirmation prompts), may touch any driv
 loops until it calls `task_done` — which it may only do after **re-verifying its own
 work** (re-reading files, re-running scripts, checking every number). Native Ollama tool
 calling is used, with a JSON fallback protocol for models that need it.
+
+### Best-in-class online research (headless)
+
+- `web_research` — one call: searches **multiple engines** (DuckDuckGo, Bing, Mojeek — automatic
+  failover), then opens the top sources **in parallel, headlessly** and returns a readable digest of
+  each with its URL. Relevant material in seconds, never a browser window.
+- `web_search` — multi-engine search with deduplication; if one engine blocks or fails, the next takes over.
+- `fetch_url` — readable-text extraction that strips page chrome, converts **tables to markdown**,
+  reports exact character totals, and reads long pages in chunks via `start_char` (PDFs detected with
+  reading instructions).
+- `open_in_browser` exists only as a visual last resort for pages that truly need interactive rendering.
 
 ### Real-time progress, in English
 

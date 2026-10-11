@@ -102,7 +102,15 @@ NOTES_FILE = UAI_DIR / "notes.md"
 SHOTS_DIR = UAI_DIR / "shots"
 SESSIONS_DIR = UAI_DIR / "sessions"
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) UltimateAI/1.0"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+
+def _browser_headers():
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
 TOOL_ARG_TRUNC = 400
 TOOL_RESULT_TRUNC = 1200
@@ -678,6 +686,69 @@ def tool_search_files(args: dict) -> str:
         return f"ERROR: {exc}"
 
 
+def _engine_ddgs(query: str, max_results: int):
+    """ddgs package (DuckDuckGo) -> [(title, url, snippet)]."""
+    if DDGS is None:
+        return []
+    with DDGS() as ddgs:
+        out = []
+        for r in ddgs.text(query, max_results=max_results):
+            url = _clean_ddg_url(r.get("href") or r.get("url") or r.get("link") or "")
+            out.append((r.get("title") or "", url, (r.get("body") or r.get("snippet") or "")[:300]))
+        return out
+
+
+def _readable_from_html(text: str) -> str:
+    """HTML -> readable text: drops chrome (nav/menu/footer/...), converts
+    tables to markdown rows, prefers <main>/<article> content."""
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form"]):
+            tag.decompose()
+        for tag in soup.find_all(attrs={"class": re.compile(r"(^|\s)(nav|menu|sidebar|footer|header)(\s|$)", re.I)}):
+            tag.decompose()
+        for table in soup.find_all("table"):
+            rows = []
+            for tr in table.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                if any(cells):
+                    rows.append("| " + " | ".join(cells) + " |")
+            if rows:
+                table.replace_with(soup.new_string("\n" + "\n".join(rows) + "\n"))
+        main = soup.find("main") or soup.find("article") or soup.find(id="content") or soup.find(role="main")
+        return re.sub(r"\n{3,}", "\n\n", (main or soup).get_text("\n"))
+    text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def _http_get_readable(url: str, max_bytes: int = 600000):
+    """GET a URL and return (kind, text, status, ctype, total_bytes).
+    kind is 'text' or 'pdf'. HTML is converted to readable text (tables become
+    markdown rows). Raises httpx/HTTP errors to the caller."""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    with _httpx().Client(timeout=30.0, follow_redirects=True, headers=_browser_headers()) as client:
+        resp = client.get(url)
+    resp.raise_for_status()
+    ctype = resp.headers.get("content-type", "")
+    if "pdf" in ctype.lower() or url.lower().split("?")[0].endswith(".pdf"):
+        return ("pdf", "", resp.status_code, ctype, len(resp.content))
+    raw = resp.content[:max_bytes]
+    text = raw.decode(resp.encoding or "utf-8", errors="replace")
+    looks_html = (
+        "html" in ctype.lower()
+        or text.lstrip()[:15].lower().startswith("<!doctype")
+        or "<html" in text[:500].lower()
+    )
+    if looks_html:
+        text = _readable_from_html(text)
+    else:
+        text = re.sub(r"\n{3,}", "\n\n", text)
+    return ("text", text, resp.status_code, ctype, len(resp.content))
+
+
 def _clean_ddg_url(href: str) -> str:
     if not href:
         return ""
@@ -690,48 +761,147 @@ def _clean_ddg_url(href: str) -> str:
     return href
 
 
-def _ddg_html_fallback(query: str, max_results: int) -> str:
+def _ddg_html_engine(query: str, max_results: int):
+    """DuckDuckGo HTML endpoint -> [(title, url, snippet)]."""
     resp = _httpx().get(
         "https://html.duckduckgo.com/html/",
         params={"q": query},
-        headers={"User-Agent": USER_AGENT},
-        timeout=20.0,
+        headers=_browser_headers(),
+        timeout=15.0,
         follow_redirects=True,
     )
     resp.raise_for_status()
-    page = resp.text
-    entries = []
+    out = []
     if BeautifulSoup is not None:
-        soup = BeautifulSoup(page, "html.parser")
-        for a in soup.select("a.result__a")[:max_results]:
-            entries.append((a.get_text(" ", strip=True), a.get("href", "")))
-    if not entries:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for res in soup.select("div.result, div.web-result")[:max_results]:
+            a = res.select_one("a.result__a") or res.find("a", href=True)
+            if a is None:
+                continue
+            snip = res.select_one(".result__snippet")
+            out.append(
+                (
+                    a.get_text(" ", strip=True),
+                    _clean_ddg_url(a.get("href", "")),
+                    (snip.get_text(" ", strip=True) if snip else "")[:300],
+                )
+            )
+    else:
         for m in re.finditer(
-            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            page,
-            re.DOTALL,
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', resp.text, re.DOTALL
         ):
             title = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
-            entries.append((title, m.group(1)))
-            if len(entries) >= max_results:
+            out.append((title, _clean_ddg_url(m.group(1)), ""))
+            if len(out) >= max_results:
                 break
-    if not entries:
-        return ""
-    lines = []
-    for i, (title, href) in enumerate(entries[:max_results], 1):
-        lines.append(f"{i}. {title}\n   {_clean_ddg_url(href)}")
-    return "\n".join(lines)
+    return [r for r in out if r[1]]
+
+
+def _engine_bing(query: str, max_results: int):
+    """Bing web results -> [(title, url, snippet)]."""
+    resp = _httpx().get(
+        "https://www.bing.com/search",
+        params={"q": query, "count": str(max(10, max_results))},
+        headers=_browser_headers(),
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    out = []
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for li in soup.select("li.b_algo")[:max_results]:
+            a = li.select_one("h2 a") or li.find("a", href=True)
+            if a is None or not a.get("href"):
+                continue
+            cap = li.select_one(".b_caption p") or li.select_one("p")
+            out.append(
+                (
+                    a.get_text(" ", strip=True),
+                    a.get("href", ""),
+                    (cap.get_text(" ", strip=True) if cap else "")[:300],
+                )
+            )
+    return [r for r in out if r[1].startswith("http")]
+
+
+def _engine_mojeek(query: str, max_results: int):
+    """Mojeek (independent index, scrape-friendly) -> [(title, url, snippet)]."""
+    resp = _httpx().get(
+        "https://www.mojeek.com/search",
+        params={"q": query},
+        headers=_browser_headers(),
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    out = []
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for li in soup.select("ul.results-standard li, li.result")[:max_results]:
+            a = li.select_one("a.title") or li.find("a", href=True)
+            if a is None:
+                continue
+            url = a.get("href", "")
+            if not url.startswith("http"):
+                continue
+            p = li.select_one("p.s") or li.find("p")
+            out.append(
+                (
+                    a.get_text(" ", strip=True),
+                    url,
+                    (p.get_text(" ", strip=True) if p else "")[:300],
+                )
+            )
+    return [r for r in out if r[1]]
+
+
+def _search_merge(query: str, max_results: int):
+    """Multi-engine search with automatic failover: ddgs package -> DuckDuckGo
+    HTML -> Bing -> Mojeek. Results are deduplicated by URL and the list of
+    engines that contributed is returned alongside."""
+    engines = (
+        ("ddgs", lambda: _engine_ddgs(query, max_results)),
+        ("duckduckgo", lambda: _ddg_html_engine(query, max_results)),
+        ("bing", lambda: _engine_bing(query, max_results)),
+        ("mojeek", lambda: _engine_mojeek(query, max_results)),
+    )
+    merged = []
+    seen = set()
+    used = []
+    errors = []
+    for name, fn in engines:
+        if len(merged) >= max_results:
+            break
+        try:
+            got = fn()
+        except Exception as exc:
+            got = []
+            errors.append(f"{name}: {type(exc).__name__}")
+        got = [r for r in got if r[1].startswith("http")]
+        if got:
+            used.append(name)
+        for title, url, snip in got:
+            key = url.rstrip("/").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((title, url, snip))
+            if len(merged) >= max_results:
+                break
+    return merged, used, errors
 
 
 @register_tool(
     "web_search",
-    "Search the web (DuckDuckGo). Uses the ddgs package when installed, otherwise an HTTP+HTML fallback. "
-    "Returns numbered title/URL/snippet results.",
+    "Search the public web across MULTIPLE engines (DuckDuckGo, Bing, Mojeek) with automatic failover - "
+    "no browser needed. Returns numbered title/URL/snippet results. For a ready-made digest of the top "
+    "pages prefer web_research.",
     {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
-            "max_results": {"type": "integer", "description": "Maximum results (default 8)"},
+            "max_results": {"type": "integer", "description": "Maximum results (default 8, max 20)"},
         },
         "required": ["query"],
     },
@@ -745,36 +915,98 @@ def tool_web_search(args: dict) -> str:
             max_results = max(1, min(20, int(args.get("max_results", 8) or 8)))
         except (TypeError, ValueError):
             max_results = 8
-        if DDGS is not None:
-            try:
-                with DDGS() as ddgs:
-                    found = list(ddgs.text(query, max_results=max_results))
-                lines = []
-                for i, r in enumerate(found[:max_results], 1):
-                    title = r.get("title") or ""
-                    url = r.get("href") or r.get("url") or r.get("link") or ""
-                    snippet = r.get("body") or r.get("snippet") or r.get("description") or ""
-                    lines.append(f"{i}. {title}\n   {url}\n   {snippet[:300]}")
-                if lines:
-                    return f"Web results for '{query}':\n" + "\n".join(lines)
-            except Exception:
-                pass  # fall through to the HTML fallback
-        fallback = _ddg_html_fallback(query, max_results)
-        if fallback:
-            return f"Web results for '{query}':\n" + fallback
-        return "ERROR: web_search returned no results (install ddgs for reliability: pip install ddgs)"
+        merged, used, errors = _search_merge(query, max_results)
+        if not merged:
+            detail = ("; engine errors: " + "; ".join(errors)) if errors else ""
+            return (
+                "ERROR: web_search returned no results from any engine"
+                + detail
+                + ". Try rewording the query, or fetch a known page directly with fetch_url."
+            )
+        lines = []
+        for i, (title, url, snip) in enumerate(merged[:max_results], 1):
+            lines.append(f"{i}. {title}\n   {url}\n   {snip}")
+        head = f"Web results for '{query}' (engines: {', '.join(used) or 'none'}):"
+        return head + "\n" + "\n".join(lines)
     except Exception as exc:
         return f"ERROR: web_search failed: {exc}"
 
 
 @register_tool(
+    "web_research",
+    "One-shot headless deep research: searches MULTIPLE engines, then downloads and reads the top "
+    "sources in parallel (no browser window) and returns a readable digest of each with its URL - "
+    "the fastest way to gather relevant material about any topic.",
+    {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Research topic or question"},
+            "max_sources": {"type": "integer", "description": "Top sources to open and digest (default 5, max 8)"},
+            "chars_per_source": {"type": "integer", "description": "Readable characters per source (default 2800)"},
+        },
+        "required": ["query"],
+    },
+)
+def tool_web_research(args: dict) -> str:
+    try:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return "ERROR: query required"
+        try:
+            max_sources = max(1, min(8, int(args.get("max_sources", 5) or 5)))
+        except (TypeError, ValueError):
+            max_sources = 5
+        try:
+            chars_per_source = max(800, min(8000, int(args.get("chars_per_source", 2800) or 2800)))
+        except (TypeError, ValueError):
+            chars_per_source = 2800
+        from concurrent.futures import ThreadPoolExecutor
+
+        merged, used, errors = _search_merge(query, max(max_sources + 3, 8))
+        if not merged:
+            detail = ("; engine errors: " + "; ".join(errors)) if errors else ""
+            return "ERROR: web_research found no sources from any engine" + detail + "."
+        picked = merged[:max_sources]
+
+        def _digest(entry):
+            title, url, snip = entry
+            try:
+                kind, text, status, ctype, _total = _http_get_readable(url, max_bytes=600000)
+                if kind == "pdf":
+                    body = "(PDF document - fetch and read it with pypdf via run_python if the contents are essential.)"
+                else:
+                    body = text[:chars_per_source]
+                return f"### {title}\nURL: {url}\n{body}\n"
+            except Exception as exc:
+                return f"### {title}\nURL: {url}\n(could not be read: {type(exc).__name__}: {str(exc)[:120]}; search snippet: {snip})\n"
+
+        with ThreadPoolExecutor(max_workers=min(6, len(picked))) as pool:
+            digests = list(pool.map(_digest, picked))
+        head = (
+            f"Research digest for '{query}' - top {len(digests)} sources "
+            f"(search engines: {', '.join(used) or 'none'}; read headlessly, no browser):\n"
+        )
+        tail = (
+            "\nUse these digests as your sources (cite the URLs). Need more of one page? "
+            "fetch_url that URL with start_char."
+        )
+        return head + "\n".join(digests) + tail
+    except Exception as exc:
+        return f"ERROR: web_research failed: {exc}"
+
+
+@register_tool(
     "fetch_url",
-    "Download a URL over HTTP(S) with httpx (TLS enabled) and return its text content; HTML pages are stripped to readable text.",
+    "Download a URL over HTTP(S) headlessly (no browser) and return READABLE text: page chrome is "
+    "stripped, tables become markdown rows, and a note tells you the total length so you can read "
+    "further sections with start_char. PDFs are detected with reading instructions.",
     {
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "URL to fetch"},
-            "max_bytes": {"type": "integer", "description": "Maximum bytes to download (default 400000)"},
+            "start_char": {"type": "integer", "description": "Readable-text offset to start from (read long pages in 45k chunks)"},
+            "max_chars": {"type": "integer", "description": "Max readable characters returned (default 45000)"},
+            "max_bytes": {"type": "integer", "description": "Maximum bytes to download (default 600000)"},
         },
         "required": ["url"],
     },
@@ -787,56 +1019,51 @@ def tool_fetch_url(args: dict) -> str:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         try:
-            max_bytes = max(1000, int(args.get("max_bytes", 400000) or 400000))
+            max_bytes = max(1000, int(args.get("max_bytes", 600000) or 600000))
         except (TypeError, ValueError):
-            max_bytes = 400000
-        with _httpx().Client(timeout=30.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-            resp = client.get(url)
-        resp.raise_for_status()
-        raw = resp.content[:max_bytes]
-        ctype = resp.headers.get("content-type", "")
-        text = raw.decode(resp.encoding or "utf-8", errors="replace")
-        looks_html = (
-            "html" in ctype.lower()
-            or text.lstrip()[:15].lower().startswith("<!doctype")
-            or "<html" in text[:500].lower()
-        )
-        if looks_html:
-            if BeautifulSoup is not None:
-                soup = BeautifulSoup(text, "html.parser")
-                for tag in soup(["script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form"]):
-                    tag.decompose()
-                for tag in soup.find_all(attrs={"class": re.compile(r"(^|\s)(nav|menu|sidebar|footer|header)(\s|$)", re.I)}):
-                    tag.decompose()
-                main = soup.find("main") or soup.find("article") or soup.find(id="content") or soup.find(role="main")
-                text = re.sub(r"\n{3,}", "\n\n", (main or soup).get_text("\n"))
-            else:
-                text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-                text = html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
-                text = re.sub(r"[ \t]{2,}", " ", text)
-                text = re.sub(r"\n{3,}", "\n\n", text)
+            max_bytes = 600000
+        try:
+            start_char = max(0, int(args.get("start_char", 0) or 0))
+        except (TypeError, ValueError):
+            start_char = 0
+        kind, text, status, ctype, total_bytes = _http_get_readable(url, max_bytes=max_bytes)
+        if kind == "pdf":
+            return (
+                f"URL: {url} (HTTP {status}, PDF document, {total_bytes} bytes)\n\n"
+                "This is a PDF (binary). To read its text: run_python with `pip install pypdf` then "
+                "`from pypdf import PdfReader; print(PdfReader(url_downloaded).pages[i].extract_text())`."
+            )
         try:
             cap = max(12000, min(60000, int(args.get("max_chars", 45000) or 45000)))
         except (TypeError, ValueError):
             cap = 45000
+        total_chars = len(text)
         note = ""
-        if len(text) > cap:
-            total = len(text)
+        if start_char:
+            end = min(start_char + cap, total_chars)
+            if start_char >= total_chars:
+                return (
+                    f"URL: {url} (HTTP {status})\n\nstart_char {start_char} is beyond the end of this page "
+                    f"({total_chars} readable characters)."
+                )
+            text = text[start_char:end]
+            note = f"\n[SHOWING chars {start_char + 1}-{end} of {total_chars}. Use start_char={end} for the next part.]"
+        elif total_chars > cap:
             text = text[:cap]
             note = (
-                f"\n[SHOWING chars 1-{cap} of {total} for this page. Refetching the same URL will return the "
-                f"same first part - to read another part run Python: urllib.request the URL and print text[{cap}:{cap * 2}], "
-                f"or fetch a more specific page/section.]"
+                f"\n[SHOWING chars 1-{cap} of {total_chars} for this page. Refetching the same URL returns the "
+                f"same first part - to read the next part call fetch_url again with start_char={cap}, "
+                f"or fetch a more specific page.]"
             )
-        size_note = f"\n[download truncated at max_bytes={max_bytes} of {len(resp.content)} bytes]" if len(resp.content) > max_bytes else ""
-        return f"URL: {url} (HTTP {resp.status_code}, {ctype or 'unknown type'})\n\n{text}{note}{size_note}"
+        size_note = f"\n[download truncated at max_bytes={max_bytes} of {total_bytes} bytes]" if total_bytes > max_bytes else ""
+        return f"URL: {url} (HTTP {status}, {ctype or 'unknown type'})\n\n{text}{note}{size_note}"
     except Exception as exc:
         return f"ERROR: fetch_url failed: {exc}"
 
 
 @register_tool(
     "open_in_browser",
-    "Open a URL in the user's default web browser.",
+    "Open a URL in the user's default VISUAL browser window. Last resort only - use web_search / web_research / fetch_url for anything text-based; open_in_browser is for pages that genuinely need interactive visual rendering.",
     {
         "type": "object",
         "properties": {
@@ -1441,8 +1668,14 @@ def build_system_prompt(override_path=None) -> str:
         "10. TOOL SEMANTICS: search_files finds files BY NAME when you OMIT 'query' (set glob_pattern only),\n"
         "    and searches file CONTENTS when you pass 'query'. fetch_url returns the FIRST section of a page\n"
         "    (with character totals in a note at the end) - NEVER refetch the same URL expecting different\n"
-        "    content; read another section via run_python + urllib.request. If a tool returns the same error\n"
+        "    content; read another section with fetch_url + start_char (long pages come with a note telling "
+        "you the exact next start_char). If a tool returns the same error\n"
         "    twice, change the arguments or approach immediately - the harness will also inject guidance.\n"
+        "11. ONLINE RESEARCH: for anything you need from the internet use web_research (ONE call - "
+        "multi-engine search plus parallel headless digests of the top sources with their URLs) or "
+        "web_search + fetch_url. This reads the web directly with no browser window. Only use "
+        "open_in_browser when a task explicitly requires interactive VISUAL rendering, since it opens a "
+        "real window on the user's screen.\n"
         "\n"
         "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files\n"
         "you wrote, re-run scripts you created, check outputs match EVERY stated requirement (counts, sums,\n"
@@ -1680,6 +1913,8 @@ def describe_tool_activity(name: str, args) -> str:
         return f"downloading {_arg_str(args, 'url')}"
     if name == "web_search":
         return f"searching the web for '{_arg_str(args, 'query')}'"
+    if name == "web_research":
+        return f"researching '{_arg_str(args, 'query')}' - searching several engines and reading the top sources headlessly"
     if name == "search_files":
         if str(args.get("query", "")).strip():
             return f"scanning {_arg_str(args, 'root')} for files containing '{_arg_str(args, 'query')}'"
@@ -1713,7 +1948,8 @@ TOOL_ERROR_HINTS = {
         "(e.g. glob_pattern='*report*'); to search text INSIDE files you must pass 'query'."
     ),
     "fetch_url": "This URL is failing - do not retry it unchanged. Use web_search to find a working URL, or try a different page.",
-    "web_search": "Change the search wording, or fetch a known page directly with fetch_url.",
+    "web_search": "Change the search wording, try web_research, or fetch a known page directly with fetch_url.",
+    "web_research": "Reword the topic, or fall back to web_search + fetch_url for individual pages.",
     "run_powershell": "Fix the command syntax (pass the raw PowerShell command - no nested 'powershell -Command').",
     "run_python": "Read the traceback, fix the code, and retry with corrected code.",
     "edit_file": "old_string must EXACTLY match text currently in the file - read_file first to get the exact text.",
