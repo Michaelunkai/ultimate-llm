@@ -22,6 +22,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -143,6 +144,100 @@ def fmt_elapsed() -> str:
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+class Heartbeat:
+    """Guarantees fresh, human-readable progress at least every `interval` seconds.
+
+    Every beat is UNIQUE (timestamp + update counter + rotating phrase + elapsed
+    seconds), so the console always shows new information - never a repeat - and
+    never goes silent for more than `interval` while a phase runs. Beats shorter
+    than one interval stay silent to avoid noise.
+    """
+
+    PHRASES = [
+        "working on it",
+        "still active",
+        "making progress",
+        "continuing",
+        "in progress",
+        "busy on the current step",
+        "processing",
+        "on it",
+    ]
+
+    def __init__(self, console: "Console", interval: float = 3.0, action=None):
+        self.console = console
+        self.interval = interval
+        self.action = action  # callable(line_text) or None -> console.print
+        self._stop = threading.Event()
+        self._thread = None
+        self._n = 0
+        self._phase = ""
+        self._detail = ""
+        self._t0 = 0.0
+        self._lock = threading.Lock()
+
+    def start(self, phase: str, detail: str = "") -> None:
+        with self._lock:
+            self._phase = phase
+            self._detail = detail
+            self._t0 = time.monotonic()
+            self._n = 0
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        # Announce the phase immediately (beat #0) so a new phase is visible at once.
+        line = self._compose()
+        try:
+            if self.action is not None:
+                self.action(line)
+            elif getattr(self.console, "is_terminal", False):
+                self.console.print(f"[dim]{line}[/]")
+            else:
+                print(line, file=(self.console.file or sys.stdout), flush=True)
+        except Exception:
+            pass
+
+    def update(self, detail: str) -> None:
+        with self._lock:
+            self._detail = detail
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _compose(self) -> str:
+        with self._lock:
+            elapsed = time.monotonic() - self._t0
+            self._n += 1
+            phrase = self.PHRASES[(self._n - 1) % len(self.PHRASES)]
+            detail = self._detail
+            phase = self._phase
+            n = self._n
+        line = f"{fmt_ts()} | {phase} | {phrase}"
+        if detail:
+            line += f" | {detail}"
+        line += f" | {elapsed:.0f}s on this step | update #{n}"
+        return line
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            line = self._compose()
+            try:
+                if self.action is not None:
+                    self.action(line)
+                elif getattr(self.console, "is_terminal", False):
+                    self.console.print(f"[dim]{line}[/]")
+                else:
+                    # Not a terminal (piped/logged run): print straight to the
+                    # underlying stream - a rich Live context would swallow
+                    # console.print() output, and the <=5s guarantee must hold.
+                    print(line, file=(self.console.file or sys.stdout), flush=True)
+            except Exception:
+                pass
+
+
 def _read_text_fallback(path: Path, max_bytes=None) -> str:
     raw = path.read_bytes()
     if max_bytes is not None:
@@ -156,7 +251,18 @@ def _read_text_fallback(path: Path, max_bytes=None) -> str:
             return raw.decode("utf-8", errors="replace")
 
 
-def _run_captured(cmd, timeout_s: float, shell: bool = False) -> str:
+def _resolve_cwd(args) -> str:
+    """Per-call working directory (default: session cwd). Validates existence."""
+    raw = str((args or {}).get("cwd", "") or "").strip()
+    if raw:
+        p = Path(_expand(raw))
+        if p.is_dir():
+            return str(p)
+    return STATE["cwd"]
+
+
+def _run_captured(cmd, timeout_s: float, shell: bool = False, cwd: str = None) -> str:
+    workdir = cwd or STATE["cwd"]
     try:
         proc = subprocess.run(
             cmd,
@@ -164,7 +270,7 @@ def _run_captured(cmd, timeout_s: float, shell: bool = False) -> str:
             text=True,
             errors="replace",
             timeout=timeout_s,
-            cwd=STATE["cwd"],
+            cwd=workdir,
             shell=shell,
         )
     except subprocess.TimeoutExpired:
@@ -174,7 +280,7 @@ def _run_captured(cmd, timeout_s: float, shell: bool = False) -> str:
     except OSError as exc:
         return f"ERROR: {exc}"
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return f"[cwd: {STATE['cwd']}]\n" + (out or "(no output)") + f"\n[exit code: {proc.returncode}]"
+    return f"[cwd: {workdir}]\n" + (out or "(no output)") + f"\n[exit code: {proc.returncode}]"
 
 
 def register_tool(name: str, description: str, parameters: dict):
@@ -198,6 +304,7 @@ def register_tool(name: str, description: str, parameters: dict):
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "PowerShell command/pipeline to run"},
+            "cwd": {"type": "string", "description": "Working directory for this command - set it to the folder of the script/file so its relative paths resolve"},
             "timeout_s": {"type": "integer", "description": "Timeout in seconds (default 120)"},
         },
         "required": ["command"],
@@ -211,6 +318,7 @@ def tool_run_powershell(args: dict) -> str:
         return _run_captured(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             _as_timeout(args.get("timeout_s")),
+            cwd=_resolve_cwd(args),
         )
     except Exception as exc:
         return f"ERROR: {exc}"
@@ -224,6 +332,7 @@ def tool_run_powershell(args: dict) -> str:
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "cmd.exe command line to run"},
+            "cwd": {"type": "string", "description": "Working directory for this command - set it to the folder of the script/file so its relative paths resolve"},
             "timeout_s": {"type": "integer", "description": "Timeout in seconds (default 120)"},
         },
         "required": ["command"],
@@ -234,7 +343,7 @@ def tool_run_cmd(args: dict) -> str:
         command = str(args.get("command", ""))
         if not command.strip():
             return "ERROR: command required"
-        return _run_captured(["cmd", "/c", command], _as_timeout(args.get("timeout_s")))
+        return _run_captured(["cmd", "/c", command], _as_timeout(args.get("timeout_s")), cwd=_resolve_cwd(args))
     except Exception as exc:
         return f"ERROR: {exc}"
 
@@ -247,6 +356,7 @@ def tool_run_cmd(args: dict) -> str:
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "Python source code to execute"},
+            "cwd": {"type": "string", "description": "Working directory for this command - set it to the folder of the script/file so its relative paths resolve"},
             "timeout_s": {"type": "integer", "description": "Timeout in seconds (default 120)"},
         },
         "required": ["code"],
@@ -261,7 +371,7 @@ def tool_run_python(args: dict) -> str:
     try:
         UAI_DIR.mkdir(parents=True, exist_ok=True)
         tmp_path.write_text(code, encoding="utf-8")
-        return _run_captured([sys.executable, str(tmp_path)], timeout_s)
+        return _run_captured([sys.executable, str(tmp_path)], timeout_s, cwd=_resolve_cwd(args))
     except Exception as exc:
         return f"ERROR: {exc}"
     finally:
@@ -473,16 +583,19 @@ def tool_find_files(args: dict) -> str:
 
 @register_tool(
     "search_files",
-    "Grep-like case-insensitive text search across files under a root directory (recursive). Returns path:line: text matches.",
+    "Find files under a root directory. TWO MODES: (1) provide 'query' to grep file CONTENTS for text "
+    "(returns path:line: text); (2) omit 'query' and set 'glob_pattern' to find FILES BY NAME "
+    "(e.g. glob_pattern='*report*' returns matching file paths). Recursive, any drive.",
     {
         "type": "object",
         "properties": {
             "root": {"type": "string", "description": "Root directory to search (default: session cwd)"},
-            "query": {"type": "string", "description": "Text to search for (case-insensitive)"},
+            "query": {"type": "string", "description": "Text to search for INSIDE files (omit for name-only search)"},
+            "glob_pattern": {"type": "string", "description": "Only consider files matching this glob (default *)"},
             "max_results": {"type": "integer", "description": "Maximum matches (default 100)"},
-            "glob_pattern": {"type": "string", "description": "Only scan files matching this glob (default *)"},
+            "max_seconds": {"type": "integer", "description": "Scan deadline in seconds (default 60)"},
         },
-        "required": ["query"],
+        "required": [],
     },
 )
 def tool_search_files(args: dict) -> str:
@@ -494,16 +607,52 @@ def tool_search_files(args: dict) -> str:
             max_results = max(1, int(args.get("max_results", 100) or 100))
         except (TypeError, ValueError):
             max_results = 100
-        if not query:
-            return "ERROR: query required"
+        try:
+            deadline_s = max(5.0, float(args.get("max_seconds", 60) or 60))
+            deadline = time.monotonic() + deadline_s
+        except (TypeError, ValueError):
+            deadline_s = 60.0
+            deadline = time.monotonic() + 60.0
         if not root.exists():
             return f"ERROR: root not found: {root}"
+
+        # NAME-ONLY MODE: no query -> glob filename search (what callers usually
+        # mean when they pass only glob_pattern). Never an error.
+        if not query:
+            base_glob = glob_pattern if any(ch in glob_pattern for ch in "*?[") else f"*{glob_pattern}*"
+            found = []
+            timed_out = False
+            try:
+                for path in root.rglob(base_glob):
+                    try:
+                        if path.is_file():
+                            found.append(str(path))
+                    except OSError:
+                        pass
+                    if len(found) >= max_results or time.monotonic() > deadline:
+                        timed_out = time.monotonic() > deadline and len(found) < max_results
+                        break
+            except OSError as exc:
+                return f"ERROR: scan failed: {exc}"
+            note = ""
+            if timed_out:
+                note = f" [scan stopped at its {deadline_s:.0f}s deadline before finishing - narrow the root or pattern]"
+            if not found:
+                return (f"No files matching '{base_glob}' under {root}.{note}\n"
+                        "Tip: this was a FILE-NAME search. To search text INSIDE files, pass 'query'.")
+            trunc = " (truncated at max_results)" if len(found) >= max_results else ""
+            return (f"{len(found)} file(s) matching '{base_glob}' under {root}{trunc}{note}:\n"
+                    + "\n".join(found))
+
         needle = query.lower()
         results = []
         stopped = ""
         try:
             for path in root.rglob(glob_pattern):
                 if len(results) >= max_results:
+                    break
+                if time.monotonic() > deadline:
+                    stopped = f" [scan hit its deadline - partial results; narrow 'root' to search the rest]"
                     break
                 try:
                     if not path.is_file() or path.stat().st_size > 2_000_000:
@@ -655,20 +804,31 @@ def tool_fetch_url(args: dict) -> str:
         if looks_html:
             if BeautifulSoup is not None:
                 soup = BeautifulSoup(text, "html.parser")
-                for tag in soup(["script", "style", "noscript", "svg"]):
+                for tag in soup(["script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form"]):
                     tag.decompose()
-                text = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n"))
+                for tag in soup.find_all(attrs={"class": re.compile(r"(^|\s)(nav|menu|sidebar|footer|header)(\s|$)", re.I)}):
+                    tag.decompose()
+                main = soup.find("main") or soup.find("article") or soup.find(id="content") or soup.find(role="main")
+                text = re.sub(r"\n{3,}", "\n\n", (main or soup).get_text("\n"))
             else:
                 text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", text, flags=re.DOTALL | re.IGNORECASE)
                 text = html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
                 text = re.sub(r"[ \t]{2,}", " ", text)
                 text = re.sub(r"\n{3,}", "\n\n", text)
-        cap = 24000
+        try:
+            cap = max(12000, min(60000, int(args.get("max_chars", 45000) or 45000)))
+        except (TypeError, ValueError):
+            cap = 45000
         note = ""
         if len(text) > cap:
+            total = len(text)
             text = text[:cap]
-            note = "\n[... text truncated to keep the context manageable ...]"
-        size_note = f"\n[download truncated at max_bytes={max_bytes}]" if len(resp.content) > max_bytes else ""
+            note = (
+                f"\n[SHOWING chars 1-{cap} of {total} for this page. Refetching the same URL will return the "
+                f"same first part - to read another part run Python: urllib.request the URL and print text[{cap}:{cap * 2}], "
+                f"or fetch a more specific page/section.]"
+            )
+        size_note = f"\n[download truncated at max_bytes={max_bytes} of {len(resp.content)} bytes]" if len(resp.content) > max_bytes else ""
         return f"URL: {url} (HTTP {resp.status_code}, {ctype or 'unknown type'})\n\n{text}{note}{size_note}"
     except Exception as exc:
         return f"ERROR: fetch_url failed: {exc}"
@@ -1261,7 +1421,9 @@ def build_system_prompt(override_path=None) -> str:
         "4. Verify using the EXACT command and working directory the mission requires. A different command\n"
         "   that looks equivalent does not count as verification.\n"
         "5. run_powershell and run_cmd already execute inside PowerShell/cmd: pass raw commands directly.\n"
-        "   Never wrap them in another powershell -Command / cmd /c layer.\n"
+        "   Never wrap them in another powershell -Command / cmd /c layer. All three run tools accept a\n"
+        "   'cwd' argument - when a command or script uses relative paths, pass cwd = that script's folder\n"
+        "   so its relative paths resolve where you intend.\n"
         "6. A plain text reply without a tool call is treated as idle: keep making tool calls until the goal\n"
         "   is fully done, then call task_done.\n"
         "7. CHECKLIST DISCIPLINE: treat every numbered requirement in the mission as a hard checklist item.\n"
@@ -1276,6 +1438,11 @@ def build_system_prompt(override_path=None) -> str:
         "   infrastructure. Git work happens ONLY inside the mission's own sandbox repo path; if a git\n"
         "   command says something already exists or finds an unexpected repository, you are in the wrong\n"
         "   directory - target the sandbox path explicitly (git -C <sandbox-repo> ...) and git init there.\n"
+        "10. TOOL SEMANTICS: search_files finds files BY NAME when you OMIT 'query' (set glob_pattern only),\n"
+        "    and searches file CONTENTS when you pass 'query'. fetch_url returns the FIRST section of a page\n"
+        "    (with character totals in a note at the end) - NEVER refetch the same URL expecting different\n"
+        "    content; read another section via run_python + urllib.request. If a tool returns the same error\n"
+        "    twice, change the arguments or approach immediately - the harness will also inject guidance.\n"
         "\n"
         "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files\n"
         "you wrote, re-run scripts you created, check outputs match EVERY stated requirement (counts, sums,\n"
@@ -1410,41 +1577,66 @@ def chat_stream(console: Console):
     assembler = ToolCallAssembler()
     parts = []
     last_render = 0.0
+    think_chars = [0]
+
+    def _status_text() -> str:
+        streamed = sum(len(p) for p in parts)
+        bits = [f"STEP streaming • {streamed} chars"]
+        if think_chars[0]:
+            bits.append(f"{think_chars[0]} reasoning chars")
+        bits.append(fmt_ts())
+        return " • ".join(bits)
 
     def _render_preview() -> Group:
-        status = Text(f"STEP streaming • {sum(len(p) for p in parts)} chars • {fmt_ts()}", style="dim")
+        status = Text(_status_text(), style="dim")
         return Group(status, Markdown("".join(parts)[-6000:]))
 
     try:
-        with _httpx().Client(timeout=_httpx().Timeout(600.0, connect=10.0)) as client:
-            with client.stream("POST", url, json=payload) as resp:
-                if resp.status_code != 200:
-                    detail = resp.read().decode("utf-8", errors="replace")[:400]
-                    raise ChatError(f"HTTP {resp.status_code} from {url}: {detail}")
-                with Live(console=console, refresh_per_second=4, transient=True) as live:
-                    for line in resp.iter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if obj.get("error"):
-                            raise ChatError(str(obj["error"]))
-                        message = obj.get("message") or {}
-                        delta = message.get("content") or ""
-                        if delta:
-                            parts.append(delta)
-                            now = time.monotonic()
-                            if now - last_render >= 0.3:
-                                live.update(_render_preview())
-                                last_render = now
-                        if message.get("tool_calls"):
-                            assembler.feed(message)
-                        if obj.get("done"):
-                            break
-                    live.update(_render_preview())
+        # The heartbeat must cover the WHOLE request: queue + prompt prefill
+        # (which can take a minute+ on long conversations before the first
+        # token) + streaming. It prints lines until the Live opens, then
+        # switches to refreshing the Live status line in place.
+        hb = Heartbeat(console, interval=3.0)
+        hb.start("model working (queue + prefill + streaming)", f"model {STATE['model']}")
+        try:
+            with _httpx().Client(timeout=_httpx().Timeout(180.0, connect=10.0)) as client:
+                with client.stream("POST", url, json=payload) as resp:
+                    if resp.status_code != 200:
+                        detail = resp.read().decode("utf-8", errors="replace")[:400]
+                        raise ChatError(f"HTTP {resp.status_code} from {url}: {detail}")
+                    with Live(console=console, refresh_per_second=4, transient=True) as live:
+                        if console.is_terminal:
+                            hb.action = lambda _line: live.update(_render_preview())
+                        hb.update(f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far")
+                        for line in resp.iter_lines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if obj.get("error"):
+                                raise ChatError(str(obj["error"]))
+                            message = obj.get("message") or {}
+                            think = message.get("thinking") or ""
+                            if think:
+                                think_chars[0] += len(think)
+                                hb.update(f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far")
+                            delta = message.get("content") or ""
+                            if delta:
+                                parts.append(delta)
+                                hb.update(f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far")
+                                now = time.monotonic()
+                                if now - last_render >= 0.3:
+                                    live.update(_render_preview())
+                                    last_render = now
+                            if message.get("tool_calls"):
+                                assembler.feed(message)
+                            if obj.get("done"):
+                                break
+        finally:
+            hb.stop()
     except _httpx().ConnectError as exc:
         raise ConnectionError(f"cannot reach Ollama at {STATE['host']} ({exc})") from exc
     except _httpx().ConnectTimeout as exc:
@@ -1466,6 +1658,149 @@ def execute_tool(name: str, args) -> str:
         return str(entry["fn"](tool_args))
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}"
+
+
+# Human-readable activity descriptions: used by the heartbeat so long-running
+# tools always show WHAT is happening in plain English.
+def _arg_str(args, key, limit=70):
+    try:
+        v = str((args or {}).get(key, "")).replace("\n", " ")
+        return v[:limit] + ("…" if len(v) > limit else "")
+    except Exception:
+        return ""
+
+
+def describe_tool_activity(name: str, args) -> str:
+    args = args if isinstance(args, dict) else {}
+    if name in ("run_powershell", "run_cmd"):
+        return f"running the command: {_arg_str(args, 'command')}"
+    if name == "run_python":
+        return "running a Python script it wrote"
+    if name == "fetch_url":
+        return f"downloading {_arg_str(args, 'url')}"
+    if name == "web_search":
+        return f"searching the web for '{_arg_str(args, 'query')}'"
+    if name == "search_files":
+        if str(args.get("query", "")).strip():
+            return f"scanning {_arg_str(args, 'root')} for files containing '{_arg_str(args, 'query')}'"
+        return f"finding files named like '{_arg_str(args, 'glob_pattern')}' under {_arg_str(args, 'root')}"
+    if name == "find_files":
+        return f"finding files matching '{_arg_str(args, 'pattern')}' under {_arg_str(args, 'root')}"
+    if name in ("read_file", "write_file", "edit_file"):
+        return f"{name.split('_')[0]}ing file {_arg_str(args, 'path')}"
+    if name == "list_dir":
+        return f"listing directory {_arg_str(args, 'path')}"
+    if name == "screenshot":
+        return "taking a screenshot of the screen"
+    if name == "list_processes":
+        return "listing running processes"
+    if name == "stop_process":
+        return f"stopping process {_arg_str(args, 'pid') or _arg_str(args, 'name')}"
+    if name == "git_run":
+        return f"running git {_arg_str(args, 'arguments')}"
+    if name == "scaffold_project":
+        return f"scaffolding a {_arg_str(args, 'kind')} project in {_arg_str(args, 'path')}"
+    if name in ("clipboard_get", "clipboard_set"):
+        return "reading/writing the Windows clipboard"
+    if name == "task_done":
+        return "finalizing the mission"
+    return f"executing {name}"
+
+
+TOOL_ERROR_HINTS = {
+    "search_files": (
+        "search_files has TWO modes: to find files BY NAME omit 'query' and set glob_pattern "
+        "(e.g. glob_pattern='*report*'); to search text INSIDE files you must pass 'query'."
+    ),
+    "fetch_url": "This URL is failing - do not retry it unchanged. Use web_search to find a working URL, or try a different page.",
+    "web_search": "Change the search wording, or fetch a known page directly with fetch_url.",
+    "run_powershell": "Fix the command syntax (pass the raw PowerShell command - no nested 'powershell -Command').",
+    "run_python": "Read the traceback, fix the code, and retry with corrected code.",
+    "edit_file": "old_string must EXACTLY match text currently in the file - read_file first to get the exact text.",
+    "stop_process": "Check the pid/name with list_processes first.",
+}
+
+
+def execute_tool_with_progress(console: "Console", name: str, args):
+    """Execute a tool with a guaranteed ≤4s heartbeat of plain-English progress."""
+    hb = Heartbeat(console, interval=3.0)
+    hb.start(f"tool {name}", describe_tool_activity(name, args))
+    t0 = time.monotonic()
+    try:
+        result = execute_tool(name, args)
+    finally:
+        hb.stop()
+    return result, time.monotonic() - t0
+
+
+def apply_stuck_guards(console: "Console", name: str, args, result) -> None:
+    """Permanently prevents stuck loops: repeated identical tool failures and
+    blind same-URL refetches trigger corrective guidance injected into the
+    conversation, so the model can never silently spin on the same mistake."""
+    g = STATE.setdefault("stuck", {"sig": None, "run": 0, "url": "", "url_run": 0})
+    result = str(result)
+    if name == "task_done":
+        return
+    if result.startswith("ERROR"):
+        sig = (name, result[:90])
+        if sig == g["sig"]:
+            g["run"] += 1
+        else:
+            g["sig"], g["run"] = sig, 1
+        if g["run"] == 2:
+            hint = TOOL_ERROR_HINTS.get(
+                name, "Read the error text carefully, change the arguments, or pick a different tool."
+            )
+            console.print("[yellow](stuck-guard: repeated identical tool failure - injecting guidance)[/]")
+            STATE["messages"].append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"(system note: this exact {name} call has now failed twice in a row with the same "
+                        f"error. {hint} Do NOT repeat the identical call - change something first.)"
+                    ),
+                }
+            )
+        elif g["run"] >= 4:
+            console.print("[yellow](stuck-guard: 4+ identical failures - forcing a different strategy)[/]")
+            STATE["messages"].append(
+                {
+                    "role": "user",
+                    "content": (
+                        "(system note: the same tool call has now failed 4+ times with the same error. STOP "
+                        "using this tool for this purpose. Take a COMPLETELY different approach to reach the "
+                        "goal, or continue with the information you already have.)"
+                    ),
+                }
+            )
+            g["sig"], g["run"] = None, 0
+    else:
+        g["sig"], g["run"] = None, 0
+        if name == "fetch_url":
+            u = ""
+            try:
+                u = str((args or {}).get("url", "")).strip()
+            except Exception:
+                u = ""
+            if u:
+                if u == g["url"]:
+                    g["url_run"] += 1
+                else:
+                    g["url"], g["url_run"] = u, 1
+                if g["url_run"] == 2:
+                    console.print("[yellow](stuck-guard: same URL refetched - injecting guidance)[/]")
+                    STATE["messages"].append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "(system note: you have fetched this exact URL repeatedly and received the same "
+                                "first section each time. The content is already in this conversation - USE it, "
+                                "or fetch a DIFFERENT URL, or read a specific part of the page via run_python "
+                                "with urllib.request, e.g. print(text[20000:40000]).)"
+                            ),
+                        }
+                    )
+                    g["url"], g["url_run"] = "", 0
 
 
 def display_tool_call(console: Console, name: str, args, k: int = 0) -> None:
@@ -1550,6 +1885,8 @@ def save_session() -> None:
 
 def run_agent_turn(user_input: str, args) -> None:
     console = STATE["console"]
+    STATE["mission_text"] = user_input
+    STATE["done_confirmed"] = False
     STATE["messages"].append({"role": "user", "content": user_input})
     save_session()
     tool_count = 0
@@ -1559,7 +1896,7 @@ def run_agent_turn(user_input: str, args) -> None:
             console.print(
                 f"[bold cyan]── STEP {_iteration}[/] [dim]• {fmt_ts()} • elapsed {fmt_elapsed()} • thinking + streaming…[/]"
             )
-            chat_retries = 2
+            chat_retries = 6
             while True:
                 try:
                     content, tool_calls = chat_stream(console)
@@ -1572,6 +1909,21 @@ def run_agent_turn(user_input: str, args) -> None:
                     chat_retries -= 1
                     if chat_retries > 0:
                         console.print(f"[yellow](chat error, retrying: {str(exc)[:140]}...)[/]")
+                        if "parsing tool call" in str(exc).lower() or "unexpected end of json" in str(exc).lower():
+                            # The model emitted a malformed tool call. Blind re-sampling
+                            # can repeat it - inject a corrective note so the retry
+                            # knows what went wrong.
+                            STATE["messages"].append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "(system note: your previous reply contained a MALFORMED tool call "
+                                        "(broken JSON) and was rejected by the server. Re-emit the same action "
+                                        "with valid JSON arguments - keep the call compact and prefer write_file "
+                                        "for long content.)"
+                                    ),
+                                }
+                            )
                         time.sleep(2.0)
                         continue
                     console.print(Panel(f"[red]Chat error: {exc}[/]", title="ERROR", border_style="red"))
@@ -1609,17 +1961,38 @@ def run_agent_turn(user_input: str, args) -> None:
                     display_tool_call(console, name, call["arguments"], k=tool_count)
                     t_call = time.monotonic()
                     try:
-                        result = execute_tool(name, call["arguments"])
+                        result, dur = execute_tool_with_progress(console, name, call["arguments"])
                     except KeyboardInterrupt:
                         result = "ERROR: interrupted by user"
-                    dur = time.monotonic() - t_call
+                        dur = time.monotonic() - t_call
                     if str(result).startswith("ERROR"):
                         tool_errors += 1
                     display_tool_result(console, name, result, dur=dur)
                     STATE["messages"].append({"role": "tool", "content": result, "name": name})
+                    apply_stuck_guards(console, name, call["arguments"], result)
                     if name == "task_done" and not result.startswith("ERROR"):
-                        done = True
-                        done_summary = result
+                        if not STATE.get("done_confirmed"):
+                            STATE["done_confirmed"] = True
+                            console.print("[yellow](completion claimed - running the verification round before accepting)[/]")
+                            STATE["messages"].append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "(verification round: re-read the mission and re-verify EVERY requirement "
+                                        "against the actual work right now - run the exact commands, count the "
+                                        "files, re-check every number and name. IMPORTANT: verify by INSPECTING "
+                                        "(read files, count entries, check state) - do NOT re-run actions with "
+                                        "side effects (running a script again can create duplicate outputs and "
+                                        "break the mission's own invariants); if you already produced the "
+                                        "artifacts, inspect them as they are. If ANYTHING is missing or wrong, "
+                                        "fix it and then call task_done again. If everything truly passes, call "
+                                        "task_done again to confirm.)"
+                                    ),
+                                }
+                            )
+                        else:
+                            done = True
+                            done_summary = result
                 save_session()
                 if done:
                     STATE["last_outcome"] = "done"
@@ -1642,16 +2015,37 @@ def run_agent_turn(user_input: str, args) -> None:
                 display_tool_call(console, name, fb_args, k=tool_count)
                 t_call = time.monotonic()
                 try:
-                    result = execute_tool(name, fb_args)
+                    result, dur = execute_tool_with_progress(console, name, fb_args)
                 except KeyboardInterrupt:
                     result = "ERROR: interrupted by user"
-                dur = time.monotonic() - t_call
+                    dur = time.monotonic() - t_call
                 if str(result).startswith("ERROR"):
                     tool_errors += 1
                 display_tool_result(console, name, result, dur=dur)
                 STATE["messages"].append({"role": "tool", "content": result, "name": name})
+                apply_stuck_guards(console, name, fb_args, result)
                 save_session()
                 if name == "task_done" and not str(result).startswith("ERROR"):
+                    if not STATE.get("done_confirmed"):
+                        STATE["done_confirmed"] = True
+                        console.print("[yellow](completion claimed - running the verification round before accepting)[/]")
+                        STATE["messages"].append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "(verification round: re-read the mission and re-verify EVERY requirement "
+                                    "against the actual work right now - run the exact commands, count the "
+                                    "files, re-check every number and name. IMPORTANT: verify by INSPECTING "
+                                    "(read files, count entries, check state) - do NOT re-run actions with "
+                                    "side effects (running a script again can create duplicate outputs and "
+                                    "break the mission's own invariants); if you already produced the "
+                                    "artifacts, inspect them as they are. If ANYTHING is missing or wrong, "
+                                    "fix it and then call task_done again. If everything truly passes, call "
+                                    "task_done again to confirm.)"
+                                ),
+                            }
+                        )
+                        continue
                     STATE["last_outcome"] = "done"
                     console.print(Panel(str(result)[:2000], title="TASK DONE", border_style="green"))
                     console.print(
@@ -1672,6 +2066,22 @@ def run_agent_turn(user_input: str, args) -> None:
                             "content": "(system note: your last reply was empty. Continue the mission now with tool calls; do not stop until every requirement is met and verified.)",
                         }
                     )
+                    continue
+                resets = STATE.get("mission_resets", 0)
+                if resets < 2:
+                    STATE["mission_resets"] = resets + 1
+                    STATE["empty_streak"] = 0
+                    console.print(f"[yellow](agent went idle - restarting the conversation with the mission, attempt {resets + 2})[/]")
+                    system_msg = STATE["messages"][0]
+                    STATE["messages"] = [system_msg]
+                    STATE["messages"].append(
+                        {
+                            "role": "user",
+                            "content": STATE["mission_text"]
+                            + "\n\n(system note: a previous attempt was interrupted and went idle. The target folders may already contain partial work - inspect what exists, then finish EVERY remaining requirement and verify.)",
+                        }
+                    )
+                    save_session()
                     continue
                 console.print("[dim](the model returned an empty response too many times)[/]")
                 STATE["last_outcome"] = "empty"
@@ -1715,7 +2125,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, help="Ollama model tag, e.g. qwen3:8b")
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama base URL")
     parser.add_argument(
-        "--max-iters", dest="max_iters", type=int, default=80, help="Max agent iterations per goal (default 80)"
+        "--max-iters", dest="max_iters", type=int, default=120, help="Max agent iterations per goal (default 120)"
     )
     parser.add_argument("--num-ctx", dest="num_ctx", type=int, default=None, help="Ollama num_ctx context window override")
     parser.add_argument(

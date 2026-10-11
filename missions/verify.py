@@ -105,7 +105,7 @@ def check_m03(ev):
         return ev.append("missing texttools/__init__.py")
     if not exists(t):
         return ev.append("missing tests/test_texttools.py")
-    n_assert = len(re.findall(r"^\s*assert\b", read(t), re.M))
+    n_assert = len(re.findall(r"\bassert\w*\s*\(", read(t), re.M))
     ev.append(f"assert count = {n_assert} (need >= 8)")
     r = subprocess.run([PY, "tests/test_texttools.py"], cwd=proj, capture_output=True, text=True, timeout=60)
     ev.append(f"python tests/test_texttools.py -> exit {r.returncode}")
@@ -321,7 +321,7 @@ def check_m11(ev):
         ev.append("missing clipboard_echo.txt")
         ok = False
     else:
-        content = read(echo).strip()
+        content = read(echo).replace("﻿", "").strip()
         ev.append(f"clipboard echo = {content!r}")
         ok = ok and content == "ULTIMATE-AGENT-CLIPBOARD-2026"
     if ok:

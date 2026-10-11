@@ -2,5 +2,5 @@ MISSION 07 - Build and run a timestamped backup automation.
 Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M07\ :
 1. Create source\ containing exactly 5 small files (file1..file5.txt).
 2. Write backup.ps1 that: builds a destination folder name backup_YYYYMMDD-HHMMSS from Get-Date, copies the ENTIRE source\ folder into it (Copy-Item -Recurse), and APPENDS one line to backup_log.txt containing the timestamp and how many files were copied.
-3. RUN backup.ps1 once with PowerShell.
-Verify: exactly one backup_* folder exists containing all 5 files with matching names, and backup_log.txt has one line whose timestamp is within a few minutes of now. Then call task_done quoting the backup folder name.
+3. RUN backup.ps1 once with PowerShell. If you ever run it more than once (e.g. while testing), delete every extra backup_* folder so EXACTLY ONE remains, and keep backup_log.txt consistent (one line per successful final run is fine).
+Verify: exactly one backup_* folder exists containing all 5 files with matching names, and backup_log.txt has at least one line whose timestamp is within a few minutes of now. Then call task_done quoting the backup folder name.
