@@ -1,0 +1,4 @@
+MISSION 10 - Live web research and synthesis.
+Using your fetch_url tool, fetch these two pages: https://example.com and https://www.iana.org/domains/reserved
+Then write F:\study\AI_ML\LocalAI\ultimate-llm\missions\M10\research_summary.md containing: at least five facts actually stated on those pages (paraphrased in your own words), each fact followed by its source URL on the same bullet, and a final "## Sources" section listing both URLs. Do not invent facts that are not on the pages.
+Re-read your file and confirm every fact traces to a fetched page, then call task_done quoting one fact you learned.

@@ -1,0 +1,5 @@
+MISSION 05 - Live system introspection report.
+1. Gather REAL values from this machine (use PowerShell / CIM, not guesswork): CPU model name, total physical RAM in GB, GPU name with its VRAM, free disk space in GB on drive F:, and the exact OS caption + version.
+2. Write F:\study\AI_ML\LocalAI\ultimate-llm\missions\M05\system_report.md with those five values clearly labeled.
+3. Also write F:\study\AI_ML\LocalAI\ultimate-llm\missions\M05\ram_chart.txt containing an ASCII bar chart of CURRENT RAM usage percent (measure it live, e.g. via Get-CimInstance Win32_OperatingSystem FreePhysicalMemory/TotalVisibleMemorySize), one bar line like [#####-----] 47% plus the measured percent value.
+Re-read both files and confirm the values match what you measured, then call task_done quoting the CPU name and RAM percent you measured.

@@ -1,0 +1,5 @@
+MISSION 02 - Sales data generation and analysis.
+Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M02\ :
+1. Write a Python script gen_data.py that creates data\sales_data.csv with a header row (date,region,product,units,revenue) and EXACTLY 200 data rows: dates spread over 2026-01-01..2026-06-30, region is one of North/South/East/West, product is one of Widget/Gadget/Doohickey, units is an integer 1-50, revenue is units * a per-product price between 2.50 and 40.00 with 2 decimals. Run it.
+2. Write analyze.py that reads the CSV with the csv module and writes report.md containing: ROW_COUNT (must be 200), TOTAL_REVENUE (sum of revenue, 2 decimals), TOP_REGION (region with highest total revenue), BEST_PRODUCT (product with highest total units), and a markdown table of total revenue per region. All numbers must be computed from the CSV, never hardcoded. Run it.
+3. Re-open report.md and cross-check TOTAL_REVENUE and TOP_REGION by recomputing independently (a second quick script or manual re-run), then call task_done with the four key numbers in your summary.

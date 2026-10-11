@@ -1,0 +1,4 @@
+MISSION 11 - Desktop capabilities proof.
+1. Take a full-screen screenshot and save it as F:\study\AI_ML\LocalAI\ultimate-llm\missions\M11\screenshot_1.png (use PowerShell with System.Windows.Forms + System.Drawing CopyFromScreen; the file must be a valid PNG larger than 30 KB).
+2. Set the Windows clipboard text to ULTIMATE-AGENT-CLIPBOARD-2026 and then read the clipboard back, writing exactly what you read into F:\study\AI_ML\LocalAI\ultimate-llm\missions\M11\clipboard_echo.txt.
+Verify: the PNG exists, starts with the PNG magic bytes and is >30 KB; clipboard_echo.txt contains exactly ULTIMATE-AGENT-CLIPBOARD-2026. Then call task_done with the file sizes.

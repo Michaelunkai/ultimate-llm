@@ -1,0 +1,5 @@
+MISSION 12 - Mini ETL pipeline.
+Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M12\ :
+1. Create raw\ containing users_1.json, users_2.json, users_3.json - each a JSON array of EXACTLY 10 objects with keys id (int, globally unique across all files), name (string), age (int 18-80), city (string). Vary ages so some are under 30 and some are 30 or older.
+2. Write etl.py that loads all three files, merges them, filters to age >= 30, writes users_30plus.json (the filtered array), and writes stats.txt with three lines: TOTAL=<n>, ADULTS=<n30plus>, OLDEST=<max age>. Run it.
+Verify by independently reloading the raw files and confirming TOTAL=30, ADULTS matches users_30plus.json length, every entry in users_30plus.json has age>=30, and OLDEST equals the true max age. Then call task_done quoting the three stats.

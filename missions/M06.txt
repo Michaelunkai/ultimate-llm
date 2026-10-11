@@ -1,0 +1,6 @@
+MISSION 06 - Create then organize a messy file tree.
+Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M06\ :
+1. Create messy\ containing EXACTLY 15 files: 5 .txt, 4 .jpg, 3 .py, 2 .md, 1 .csv (tiny placeholder content in each; .jpg files may be small binary-ish placeholders written as bytes or text, name them photo1..photo4.jpg).
+2. Create sorted\ with subfolders txt, jpg, py, md, csv.
+3. MOVE every file from messy\ into the matching sorted\ subfolder so messy\ ends up with zero files.
+Verify: each sorted subfolder holds exactly the right count (5,4,3,2,1) and messy\ is empty (recursive check), then call task_done with the counts.

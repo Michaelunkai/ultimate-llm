@@ -32,11 +32,12 @@ from pathlib import Path
 import httpx
 import psutil
 import pyperclip
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 # --- Optional dependencies (guarded; degrade with a one-time notice) --------
 try:
@@ -104,6 +105,14 @@ def _as_timeout(value, default: float = 120.0) -> float:
         return out if out > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def fmt_ts() -> str: return datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond // 1000:03d}"
+
+
+def fmt_elapsed() -> str:
+    s = max(0, int(time.monotonic() - STATE.get("t_start_mono", time.monotonic())))
+    return f"{s // 60:02d}:{s % 60:02d}"
 
 
 def _read_text_fallback(path: Path, max_bytes=None) -> str:
@@ -1210,6 +1219,11 @@ def build_system_prompt(override_path=None) -> str:
         "\n"
         "AVAILABLE TOOLS:\n"
         f"{tool_docs}"
+        "\n\n"
+        "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files you\n"
+        "wrote, re-run scripts you created, check outputs match every stated requirement, and fix any gap found.\n"
+        "A task is complete only when your own verification passes. Your task_done summary must briefly state what\n"
+        "you verified and how."
     )
 
 
@@ -1339,6 +1353,11 @@ def chat_stream(console: Console):
     assembler = ToolCallAssembler()
     parts = []
     last_render = 0.0
+
+    def _render_preview() -> Group:
+        status = Text(f"STEP streaming • {sum(len(p) for p in parts)} chars • {fmt_ts()}", style="dim")
+        return Group(status, Markdown("".join(parts)[-6000:]))
+
     try:
         with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
             with client.stream("POST", url, json=payload) as resp:
@@ -1362,13 +1381,13 @@ def chat_stream(console: Console):
                             parts.append(delta)
                             now = time.monotonic()
                             if now - last_render >= 0.3:
-                                live.update(Markdown("".join(parts)[-6000:]))
+                                live.update(_render_preview())
                                 last_render = now
                         if message.get("tool_calls"):
                             assembler.feed(message)
                         if obj.get("done"):
                             break
-                    live.update(Markdown("".join(parts)[-6000:]))
+                    live.update(_render_preview())
     except httpx.ConnectError as exc:
         raise ConnectionError(f"cannot reach Ollama at {STATE['host']} ({exc})") from exc
     except httpx.ConnectTimeout as exc:
@@ -1390,23 +1409,27 @@ def execute_tool(name: str, args) -> str:
         return f"ERROR: {type(exc).__name__}: {exc}"
 
 
-def display_tool_call(console: Console, name: str, args) -> None:
+def display_tool_call(console: Console, name: str, args, k: int = 0) -> None:
     try:
         arg_text = json.dumps(args, ensure_ascii=False, default=str) if isinstance(args, dict) else str(args)
     except Exception:
         arg_text = str(args)
     if len(arg_text) > TOOL_ARG_TRUNC:
         arg_text = arg_text[:TOOL_ARG_TRUNC] + " ...[truncated]"
-    console.print(Panel(arg_text or "{}", title=f"TOOL CALL - {name}", border_style="cyan"))
+    console.print(Panel(arg_text or "{}", title=f"TOOL CALL #{k} • {name} • {fmt_ts()}", border_style="cyan"))
 
 
-def display_tool_result(console: Console, name: str, result: str) -> None:
+def display_tool_result(console: Console, name: str, result: str, dur: float = 0.0) -> None:
     text = str(result)
     is_error = text.startswith("ERROR")
     if len(text) > TOOL_RESULT_TRUNC:
         text = text[:TOOL_RESULT_TRUNC] + " ...[truncated]"
     console.print(
-        Panel(text, title=f"{name} - {'ERROR' if is_error else 'RESULT'}", border_style="red" if is_error else "green")
+        Panel(
+            text,
+            title=f"{name} RESULT • {dur:.1f}s • {'ERROR' if is_error else 'OK'}",
+            border_style="red" if is_error else "green",
+        )
     )
 
 
@@ -1470,12 +1493,18 @@ def run_agent_turn(user_input: str, args) -> None:
     console = STATE["console"]
     STATE["messages"].append({"role": "user", "content": user_input})
     save_session()
+    tool_count = 0
+    tool_errors = 0
     try:
         for _iteration in range(1, max(1, args.max_iters) + 1):
+            console.print(
+                f"[bold cyan]── STEP {_iteration}[/] [dim]• {fmt_ts()} • elapsed {fmt_elapsed()} • thinking + streaming…[/]"
+            )
             try:
                 content, tool_calls = chat_stream(console)
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted by user.[/]")
+                STATE["last_outcome"] = "interrupted"
                 return
             except ConnectionError as exc:
                 console.print(
@@ -1489,10 +1518,12 @@ def run_agent_turn(user_input: str, args) -> None:
                         border_style="red",
                     )
                 )
+                STATE["last_outcome"] = "chat_error"
                 save_session()
                 raise SystemExit(2) from exc
             except ChatError as exc:
                 console.print(Panel(f"[red]Chat error: {exc}[/]", title="ERROR", border_style="red"))
+                STATE["last_outcome"] = "chat_error"
                 return
 
             assistant_msg = {"role": "assistant", "content": content}
@@ -1510,19 +1541,30 @@ def run_agent_turn(user_input: str, args) -> None:
                 done_summary = ""
                 for call in tool_calls:
                     name = call["name"]
-                    display_tool_call(console, name, call["arguments"])
+                    tool_count += 1
+                    display_tool_call(console, name, call["arguments"], k=tool_count)
+                    t_call = time.monotonic()
                     try:
                         result = execute_tool(name, call["arguments"])
                     except KeyboardInterrupt:
                         result = "ERROR: interrupted by user"
-                    display_tool_result(console, name, result)
+                    dur = time.monotonic() - t_call
+                    if str(result).startswith("ERROR"):
+                        tool_errors += 1
+                    display_tool_result(console, name, result, dur=dur)
                     STATE["messages"].append({"role": "tool", "content": result, "name": name})
                     if name == "task_done":
                         done = True
                         done_summary = result
                 save_session()
                 if done:
+                    STATE["last_outcome"] = "done"
                     console.print(Panel(str(done_summary)[:2000], title="TASK DONE", border_style="green"))
+                    console.print(
+                        f"[bold green]TASK CONFIRMED COMPLETE[/] [dim]• started {STATE['t_start_wall']:%H:%M:%S} • "
+                        f"finished {fmt_ts()} • total {fmt_elapsed()} • steps {_iteration} • "
+                        f"tool calls {tool_count} ({tool_errors} errors)[/]"
+                    )
                     return
                 continue
 
@@ -1532,16 +1574,27 @@ def run_agent_turn(user_input: str, args) -> None:
                 shown = strip_fallback_json(content)
                 if shown:
                     console.print(Markdown(shown))
-                display_tool_call(console, name, fb_args)
+                tool_count += 1
+                display_tool_call(console, name, fb_args, k=tool_count)
+                t_call = time.monotonic()
                 try:
                     result = execute_tool(name, fb_args)
                 except KeyboardInterrupt:
                     result = "ERROR: interrupted by user"
-                display_tool_result(console, name, result)
+                dur = time.monotonic() - t_call
+                if str(result).startswith("ERROR"):
+                    tool_errors += 1
+                display_tool_result(console, name, result, dur=dur)
                 STATE["messages"].append({"role": "tool", "content": result, "name": name})
                 save_session()
                 if name == "task_done":
+                    STATE["last_outcome"] = "done"
                     console.print(Panel(str(result)[:2000], title="TASK DONE", border_style="green"))
+                    console.print(
+                        f"[bold green]TASK CONFIRMED COMPLETE[/] [dim]• started {STATE['t_start_wall']:%H:%M:%S} • "
+                        f"finished {fmt_ts()} • total {fmt_elapsed()} • steps {_iteration} • "
+                        f"tool calls {tool_count} ({tool_errors} errors)[/]"
+                    )
                     return
                 continue
 
@@ -1549,10 +1602,13 @@ def run_agent_turn(user_input: str, args) -> None:
                 console.print(Markdown(content))
             else:
                 console.print("[dim](the model returned an empty response)[/]")
+                STATE["last_outcome"] = "empty"
             return
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/]")
+        STATE["last_outcome"] = "interrupted"
         return
+    STATE["last_outcome"] = "max_iters"
     console.print(
         Panel(
             f"[bold red]MAX ITERATIONS[/] - the agent loop stopped after {args.max_iters} iterations without task_done.",
@@ -1582,6 +1638,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Auto-approve every tool call (this is already the default; accepted for explicitness)",
     )
     parser.add_argument("--system", default=None, help="Path to a file whose content replaces the built-in system prompt")
+    parser.add_argument(
+        "--mission",
+        default=None,
+        help="Mission text to run non-interactively (exits when done). Prefix with @ to read the text from a "
+        "UTF-8 file, e.g. --mission @C:/path/mission.txt",
+    )
     parser.add_argument("--self-test", dest="self_test", action="store_true", help="Run the offline self-test suite and exit")
     return parser
 
@@ -1635,10 +1697,11 @@ def run_self_test() -> int:
             f"assembler merged arguments wrong: {calls[0]['arguments']!r}"
         )
 
-        # 4) system prompt lists (almost) every tool
+        # 4) system prompt lists (almost) every tool and carries the verification protocol
         prompt = build_system_prompt()
         present = sum(1 for n in TOOLS if n in prompt)
         assert present >= 20, f"system prompt lists only {present} tool names, expected >= 20"
+        assert "VERIFICATION PROTOCOL" in prompt, "system prompt missing VERIFICATION PROTOCOL block"
 
         print("SELF-TEST PASS")
         return 0
@@ -1686,8 +1749,39 @@ def main(argv=None) -> int:
     except Exception:
         STATE["session_file"] = None
 
+    STATE["t_start_wall"] = datetime.now()
+    STATE["t_start_mono"] = time.monotonic()
+
     print_banner(console)
     flush_optional_notices(console)
+
+    if args.mission:
+        mission_text = args.mission
+        if mission_text.startswith("@"):
+            mission_path = Path(mission_text[1:])
+            try:
+                mission_text = mission_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                console.print(f"[red]Could not read --mission file {mission_path}: {exc}[/]")
+                return 1
+        if not mission_text.strip():
+            console.print("[red]--mission text is empty.[/]")
+            return 1
+        STATE["last_outcome"] = None
+        try:
+            run_agent_turn(mission_text, args)
+        except SystemExit:
+            pass  # CONNECT FAILED path already recorded last_outcome
+        outcome = STATE.get("last_outcome")
+        if outcome == "max_iters":
+            return 3
+        if outcome == "chat_error":
+            return 1
+        if outcome in ("interrupted", "empty"):
+            console.print("[yellow]mission ended without task_done confirmation[/]")
+            return 4
+        return 0
+
     console.print("[dim]Type your goal and press Enter. Commands: /tools  /model <tag>  /reset  /save  /exit[/]")
     save_session()
 

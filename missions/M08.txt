@@ -1,0 +1,4 @@
+MISSION 08 - Build and exercise a todo CLI.
+Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M08\ write todo.py, a command-line todo manager persisting to todo_data.json with three subcommands: add "<text>" (prints the new id), list (prints id, done/undone marker and text), done <id> (marks done).
+Then USE your own tool via run_powershell to: add "write report", add "review PR", add "ship release", mark id 2 done, and run list.
+Verify todo_data.json contains 3 todos with exactly one done=true (review PR), then call task_done quoting the final list output.

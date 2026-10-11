@@ -1,0 +1,6 @@
+MISSION 01 - Build a working calculator website.
+Create exactly three files inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M01\site\ :
+1. index.html - a calculator web app titled "Ultimate Calculator" with a display area and buttons for digits 0-9, operators + - * /, a decimal point, = , and C (clear).
+2. style.css - a clean dark modern stylesheet linked from index.html.
+3. app.js - vanilla JavaScript linked from index.html that wires every button with event listeners, computes results when = is pressed WITHOUT using eval(), supports chained operations, and C resets the display.
+Requirements: index.html must reference both style.css and app.js; every digit 0-9 must have a button; no external libraries or CDNs. After writing all files, re-open them and verify every requirement, then call task_done with a summary.

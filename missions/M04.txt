@@ -1,0 +1,9 @@
+MISSION 04 - Complete Git workflow.
+Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M04\repo\ perform a full git workflow using the git_run tool (or run_powershell with git commands):
+1. git init; set local user.name "Ultimate Agent" and user.email "agent@ultimate.local".
+2. Create README.md and commit with message "chore: init project".
+3. Create src\app.py (a tiny hello script) and commit "feat: add app".
+4. Create docs\notes.md and commit "docs: add notes".
+5. Create and switch to branch feature/experimental, add feature.txt, commit "feat: experimental feature".
+6. Switch back to the default branch (main or master).
+Verify with git log --oneline (expect 4 commits) and git branch (expect feature/experimental listed and the default branch checked out), then call task_done listing the commits.
