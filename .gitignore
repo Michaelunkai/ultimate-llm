@@ -1,0 +1,9 @@
+# Local runtime state - never commit
+.venv/
+__pycache__/
+*.pyc
+.bootstrap-state.json
+backup_log.txt
+data/
+report.md
+*.log
