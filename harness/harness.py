@@ -139,6 +139,7 @@ CONFIG_DEFAULTS = {
     "keep_last_messages": 8,
     "auto_update": False,         # /update auto-switches model after a pull
     "theme": "dim",
+    "stream_stall_s": 45,         # no-stream-data watchdog: kill + retry beyond this
 }
 
 
@@ -154,6 +155,8 @@ def _cfg_valid(key: str, value) -> bool:
             return isinstance(value, bool)
         if key == "theme":
             return value in ("dim", "bright")
+        if key == "stream_stall_s":
+            return 10.0 <= float(value) <= 300.0
     except (TypeError, ValueError):
         return False
     return False
@@ -2333,6 +2336,26 @@ class ChatError(RuntimeError):
     """Non-fatal chat/protocol error (bad HTTP status, model error, stream error)."""
 
 
+def _model_resident_note() -> str:
+    """'' when the model is fully resident on the GPU; an honest, specific
+    note otherwise (so a cold or in-progress load is never mistaken for a
+    hang, and the watchdog never kills a legitimate load)."""
+    try:
+        r = _httpx().get(STATE["host"].rstrip("/") + "/api/ps", timeout=2.5)
+        for m in r.json().get("models", []):
+            if str(m.get("name", "")).startswith(str(STATE.get("model", "")).split(":")[0]):
+                vram = int(m.get("size_vram", 0) or 0)
+                total = int(m.get("size", 0) or 0)
+                if vram <= 0:
+                    return "model not on the GPU yet - cold-loading weights (first use after idle; can take 30-90s)"
+                if total and vram < total * 0.5:
+                    return "model is still loading onto the GPU (partial residency) - streaming starts when it completes"
+                return ""
+        return "model not on the GPU yet - cold-loading weights (first use after idle; can take 30-90s)"
+    except Exception:
+        return ""
+
+
 def chat_stream(console: Console):
     """Stream one assistant turn from Ollama POST {host}/api/chat (NDJSON).
 
@@ -2342,73 +2365,133 @@ def chat_stream(console: Console):
     in-place status line (no newline => no scroll), every <=2.5s, and logs the
     <=5s guarantee to the JSONL audit trail. Piped runs keep the classic plain
     Heartbeat lines (3s). The caller renders the finished answer as Markdown.
-    """
+
+    Anti-stall guarantees: the NDJSON reader runs on a worker thread while this
+    thread watches it — if NO bytes arrive for CONFIG stream_stall_s (default
+    45s) the stalled request is killed and a retryable ChatError is raised, and
+    a cold model is reported honestly via /api/ps instead of looking stuck."""
     payload = {
         "model": STATE["model"],
         "messages": STATE["messages"],
         "stream": True,
-        "keep_alive": "1h",
+        "keep_alive": "24h",  # keep the weights resident all day - no cold stalls
         "tools": ollama_tools_schema(),
     }
     if STATE.get("num_ctx"):
         payload["options"] = {"num_ctx": STATE["num_ctx"]}
     url = STATE["host"].rstrip("/") + "/api/chat"
     assembler = ToolCallAssembler()
-    parts = []
-    think_parts = []
+    parts: list = []
+    think_parts: list = []
     think_chars = [0]
 
-    try:
-        # Progress must cover the WHOLE request: queue + prompt prefill (which
-        # can take a minute+ on long conversations before the first token) +
-        # streaming.
-        prog, owned = acquire_progress(
-            console, "model working (queue + prefill + streaming)", f"model {STATE['model']}"
-        )
+    prog, owned = acquire_progress(
+        console, "model working (queue + prefill + streaming)", f"model {STATE['model']}"
+    )
+    note = _model_resident_note()
+    if note:
+        prog.update(detail=note)
+
+    box = {"error": None, "done": False, "pec": None, "last": time.monotonic(), "chars": 0}
+    client = _httpx().Client(timeout=_httpx().Timeout(180.0, connect=10.0))
+
+    def _reader() -> None:
         try:
-            with _httpx().Client(timeout=_httpx().Timeout(180.0, connect=10.0)) as client:
-                with client.stream("POST", url, json=payload) as resp:
-                    if resp.status_code != 200:
-                        detail = resp.read().decode("utf-8", errors="replace")[:400]
-                        raise ChatError(f"HTTP {resp.status_code} from {url}: {detail}")
-                    for line in resp.iter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if obj.get("error"):
-                            raise ChatError(str(obj["error"]))
-                        message = obj.get("message") or {}
-                        think = message.get("thinking") or ""
-                        if think:
-                            think_parts.append(think)
-                            think_chars[0] += len(think)
-                        delta = message.get("content") or ""
-                        if delta:
-                            parts.append(delta)
-                        if think or delta:
-                            prog.update(
-                                f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far"
-                            )
-                        if message.get("tool_calls"):
-                            assembler.feed(message)
-                        if obj.get("done"):
-                            # Real context size from the server -> drives compaction.
-                            pec = obj.get("prompt_eval_count")
-                            if pec:
-                                STATE["ctx_tokens"] = int(pec)
-                            break
+            with client.stream("POST", url, json=payload) as resp:
+                if resp.status_code != 200:
+                    detail = resp.read().decode("utf-8", errors="replace")[:400]
+                    box["error"] = ChatError(f"HTTP {resp.status_code} from {url}: {detail}")
+                    return
+                for line in resp.iter_lines():
+                    box["last"] = time.monotonic()
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("error"):
+                        raise ChatError(str(obj["error"]))
+                    message = obj.get("message") or {}
+                    think = message.get("thinking") or ""
+                    if think:
+                        think_parts.append(think)
+                        think_chars[0] += len(think)
+                    delta = message.get("content") or ""
+                    if delta:
+                        parts.append(delta)
+                        box["chars"] += len(delta)
+                    if think or delta:
+                        prog.update(
+                            f"{sum(len(p) for p in parts)} answer chars, {think_chars[0]} reasoning chars so far"
+                        )
+                    if message.get("tool_calls"):
+                        assembler.feed(message)
+                    if obj.get("done"):
+                        # Real context size from the server -> drives compaction.
+                        pec = obj.get("prompt_eval_count")
+                        if pec:
+                            box["pec"] = int(pec)
+                        break
+        except ChatError as exc:
+            box["error"] = exc
+        except _httpx().ConnectError as exc:
+            box["error"] = ConnectionError(f"cannot reach Ollama at {STATE['host']} ({exc})")
+        except _httpx().ConnectTimeout as exc:
+            box["error"] = ConnectionError(f"connection to Ollama at {STATE['host']} timed out ({exc})")
+        except _httpx().TransportError as exc:
+            # includes the watchdog-induced client close
+            box["error"] = ConnectionError(f"Ollama connection dropped ({exc})")
+        except Exception as exc:  # never let the reader die silently
+            box["error"] = ChatError(f"stream reader: {type(exc).__name__}: {exc}")
         finally:
-            release_progress(prog, owned)
-    except _httpx().ConnectError as exc:
-        raise ConnectionError(f"cannot reach Ollama at {STATE['host']} ({exc})") from exc
-    except _httpx().ConnectTimeout as exc:
-        raise ConnectionError(f"connection to Ollama at {STATE['host']} timed out ({exc})") from exc
-    except _httpx().TransportError as exc:
-        raise ConnectionError(f"Ollama connection dropped ({exc})") from exc
+            box["done"] = True
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    stall_s = float(CONFIG.get("stream_stall_s", 45) or 45)
+    try:
+        while not box["done"]:
+            time.sleep(0.5)
+            stalled = time.monotonic() - box["last"]
+            if stalled > 8 and box["chars"] == 0 and not think_parts:
+                prog.update(detail=f"0 tokens for {stalled:.0f}s - {note or 'server queue busy, still waiting'}")
+            if stalled > stall_s:
+                # Before killing a silent stream, check whether the model is
+                # cold-loading (first use, or the daemon restarted): silence is
+                # EXPECTED then, and killing would restart the load forever.
+                # Patience extends to 240s with honest beats; a truly dead
+                # stream still gets killed at the normal threshold.
+                fresh = _model_resident_note()
+                if fresh and stalled < 240.0:
+                    if fresh != note:
+                        note = fresh
+                        prog.update(detail=f"{fresh} ({stalled:.0f}s)")
+                    continue
+                try:
+                    client.close()  # kills the stalled stream
+                except Exception:
+                    pass
+                reader.join(timeout=5)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                raise ChatError(
+                    f"stream watchdog: no data for {stalled:.0f}s - killed the stalled request, retrying"
+                )
+        if box["error"] is not None:
+            raise box["error"]
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        release_progress(prog, owned)
+
+    if box["pec"]:
+        STATE["ctx_tokens"] = int(box["pec"])
     think_text = "".join(think_parts)
     if think_text:
         # gpt-oss needs its past chain-of-thought round-tripped on tool-loop
@@ -2810,75 +2893,115 @@ def prompt_with_history(prompt_str: str, history: list) -> str:
     """Interactive single-line input with Up/Down history navigation across ALL
     sessions (newest first; Down past the newest restores the draft). Requires
     a real console (msvcrt); callers fall back to console.input otherwise.
-    Raises KeyboardInterrupt on Ctrl+C."""
+    Raises KeyboardInterrupt on Ctrl+C.
+
+    Long input (or a pasted sentence) can wrap over several physical rows, so
+    every redraw first erases the ENTIRE wrapped block (cursor-up + erase-to-
+    end-of-display); rapid char floods (paste) are coalesced by a 20ms throttle
+    with a background flusher so the final line is always drawn correctly."""
     import msvcrt  # Windows-only, imported lazily
 
+    width = max(20, shutil.get_terminal_size((120, 30)).columns)
     sys.stdout.write(prompt_str)
     sys.stdout.flush()
     buf: list = []
     cur = 0
     hpos = len(history)
     draft: list = []
+    draw_lock = threading.Lock()
+    view = {"prev_len": len(prompt_str), "last": 0.0, "pending": False}
+    stop_flush = threading.Event()
 
-    def redraw():
-        _editor_redraw(prompt_str, buf, cur)
+    def redraw(force: bool = False) -> None:
+        with draw_lock:
+            rendered = prompt_str + "".join(buf)
+            now = time.monotonic()
+            if not force and now - view["last"] < 0.02:
+                view["pending"] = True  # paste flood: coalesce
+                return
+            view["last"] = now
+            view["pending"] = False
+            prev_rows = max(1, -(-view["prev_len"] // width))
+            if prev_rows > 1:
+                out = "\r\x1b[" + str(prev_rows - 1) + "A\x1b[J"  # start of block, erase to end of display
+            else:
+                out = "\r\x1b[K"
+            out += rendered
+            over = len(buf) - cur
+            if over > 0:
+                out += "\x1b[" + str(over) + "D"
+            sys.stdout.write(out)
+            sys.stdout.flush()
+            view["prev_len"] = len(rendered)
 
-    while True:
-        ch = msvcrt.getwch()
-        if ch == "\r":  # ONLY \r submits; a pasted \n is ignored (paste safety -
-            # pasting multi-line text must not fire N prompts)
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            return "".join(buf)
-        if ch == "\n":
-            continue
-        if ch == "\x03":  # Ctrl+C
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            raise KeyboardInterrupt
-        if ch == "\x08":  # Backspace
-            if cur > 0:
-                del buf[cur - 1]
-                cur -= 1
-                redraw()
-            continue
-        if ch in ("\x00", "\xe0"):  # Windows special-key prefix
-            nxt = msvcrt.getwch()
-            if nxt == "H":  # Up: older prompt
-                if history and hpos > 0:
-                    if hpos == len(history):
-                        draft = list(buf)
-                    hpos -= 1
-                    buf = list(history[hpos])
+    def _flusher() -> None:
+        while not stop_flush.wait(0.05):
+            if view["pending"]:
+                redraw(force=True)
+
+    flusher = threading.Thread(target=_flusher, daemon=True)
+    flusher.start()
+
+    try:
+        while True:
+            ch = msvcrt.getwch()
+            if ch == "\r":  # ONLY \r submits; a pasted \n is ignored (paste safety -
+                # pasting multi-line text must not fire N prompts)
+                redraw(force=True)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buf)
+            if ch == "\n":
+                continue
+            if ch == "\x03":  # Ctrl+C
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+            if ch == "\x08":  # Backspace
+                if cur > 0:
+                    del buf[cur - 1]
+                    cur -= 1
+                    redraw(force=True)
+                continue
+            if ch in ("\x00", "\xe0"):  # Windows special-key prefix
+                nxt = msvcrt.getwch()
+                if nxt == "H":  # Up: older prompt
+                    if history and hpos > 0:
+                        if hpos == len(history):
+                            draft = list(buf)
+                        hpos -= 1
+                        buf = list(history[hpos])
+                        cur = len(buf)
+                        redraw(force=True)
+                elif nxt == "P":  # Down: newer prompt / draft
+                    if hpos < len(history):
+                        hpos += 1
+                        buf = list(draft if hpos == len(history) else history[hpos])
+                        cur = len(buf)
+                        redraw(force=True)
+                elif nxt == "K" and cur > 0:  # Left
+                    cur -= 1
+                    redraw(force=True)
+                elif nxt == "M" and cur < len(buf):  # Right
+                    cur += 1
+                    redraw(force=True)
+                elif nxt == "G":  # Home
+                    cur = 0
+                    redraw(force=True)
+                elif nxt == "O":  # End
                     cur = len(buf)
-                    redraw()
-            elif nxt == "P":  # Down: newer prompt / draft
-                if hpos < len(history):
-                    hpos += 1
-                    buf = list(draft if hpos == len(history) else history[hpos])
-                    cur = len(buf)
-                    redraw()
-            elif nxt == "K" and cur > 0:  # Left
-                cur -= 1
-                redraw()
-            elif nxt == "M" and cur < len(buf):  # Right
+                    redraw(force=True)
+                elif nxt == "S" and cur < len(buf):  # Delete
+                    del buf[cur]
+                    redraw(force=True)
+                continue
+            if ch >= " ":
+                buf.insert(cur, ch)
                 cur += 1
                 redraw()
-            elif nxt == "G":  # Home
-                cur = 0
-                redraw()
-            elif nxt == "O":  # End
-                cur = len(buf)
-                redraw()
-            elif nxt == "S" and cur < len(buf):  # Delete
-                del buf[cur]
-                redraw()
-            continue
-        if ch >= " ":
-            buf.insert(cur, ch)
-            cur += 1
-            redraw()
-        # other control characters are ignored
+            # other control characters are ignored
+    finally:
+        stop_flush.set()
 
 
 # --- Context compaction (infinite session memory) --------------------------------
@@ -3694,6 +3817,7 @@ def cmd_config(console, user_input="", **kw):
         "keep_last_messages": "4–40 · 8",
         "auto_update": "true|false · false",
         "theme": "dim|bright · dim",
+        "stream_stall_s": "10–300 · 45 (kill+retry a silent stream)",
     }
     if len(parts) == 1:
         table = Table(title="CONFIG (~/.ultimate-ai/config.json)", border_style="cyan")

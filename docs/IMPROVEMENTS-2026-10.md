@@ -22,3 +22,10 @@ S-C harness/UX), each triaged APPLIED / REJECTED with reason and source.
 Raw scout reports with full source lists: session archive (2026-10-12), evidence
 bundles under missions/logs/. VRAM A/B raw data: this file row 3 + baseline
 summary in missions/logs/baseline-20261012-003125/.
+
+## Never-stuck hardening (live-session feedback, 11:05 session)
+
+| # | Finding | Verdict | Where |
+|---|---|---|---|
+| 14 | Pasting a long prompt echoed one stacked wrapped copy PER CHARACTER (33+ lines of garbage that looks like a freeze). Root cause: per-char full redraw where `\r`+`ESC[K` only clears ONE physical row once the line wraps. | **FIXED** | prompt_with_history: redraw erases the whole wrapped block (cursor-up + erase-to-end), 20 ms coalescing throttle + 50 ms flusher thread. Proof: tools/paste_proof.py — 275-char instant paste renders as exactly ONE line (1 prompt glyph), model answers, exit 0. |
+| 15 | First message after idle sat silent: cold model load (~30-90 s) with a static status line and a stream that would never time out. | **FIXED (3 layers)** | (a) honest status via /api/ps ("cold-loading weights", "partial residency"); (b) stream stall watchdog — reader thread + watcher, kills + retries a stream silent beyond CONFIG stream_stall_s (45 s), with cold-load patience to 240 s so a legitimate load is never killed (zero-kill proven); (c) keep_alive 24h on chat + launcher warm-up so weights stay resident all day. Proof: dead-server test (11 kills, beats every ≤3.03 s, clean exit), cold-start M03 (12 notes, 0 kills, verified 1/1, max gap 3.01 s). |

@@ -258,7 +258,7 @@ if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offli
         # Warm the model in the background (detached; 60-minute keep-alive) so the
         # very first message does not wait for the weights to load.
         try {
-            $warmCmd = "Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:11434/api/generate' -ContentType 'application/json' -TimeoutSec 300 -Body (@{ model='" + $tag + "'; prompt=''; keep_alive='60m'; stream=`$false } | ConvertTo-Json) | Out-Null"
+            $warmCmd = "Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:11434/api/generate' -ContentType 'application/json' -TimeoutSec 300 -Body (@{ model='" + $tag + "'; prompt=''; keep_alive='24h'; stream=`$false } | ConvertTo-Json) | Out-Null"
             Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $warmCmd) | Out-Null
         }
         catch { }
