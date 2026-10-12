@@ -198,6 +198,11 @@ function Ensure-Prerequisites {
             if (Test-PrereqOllamaDaemon -OllamaExe $ollamaPath) { break }
             Start-Sleep -Seconds 2
         } while ((Get-Date) -lt $deadline)
+        # CPU courtesy: the GPU-bound daemon stays below normal CPU priority.
+        try {
+            Get-Process -Name ollama,ollama_llama_server -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = 'BelowNormal' } catch { } }
+        }
+        catch { }
     }
 
     # 3) python

@@ -4,7 +4,7 @@ Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M04\repo\ perform a full git
 2. Create README.md and commit with message "chore: init project".
 3. Create src\app.py (a tiny hello script) and commit "feat: add app".
 4. Create docs\notes.md and commit "docs: add notes".
-5. Create and switch to branch feature/experimental, add feature.txt, commit "feat: experimental feature".
-6. Switch back to the default branch (main or master).
-7. FINAL STATE CHECK before task_done - run `git rev-parse --abbrev-ref HEAD`: it MUST print main or master. If it prints feature/experimental, run the checkout again and re-check. Your task_done summary must QUOTE the exact output of that command - if the quote does not say main or master the mission fails.
+5. ONLY AFTER the 3 commits exist on the default branch: create and switch to branch feature/experimental (git checkout -b feature/experimental), add feature.txt, commit "feat: experimental feature".
+6. Switch back to the default branch: run `git branch` first and READ the list - the default branch is master or main (whichever exists); then run `git checkout master` (or `git checkout main` for the one that exists). If checkout errors, fix the branch name from the `git branch` list and retry. NEVER stay on feature/experimental.
+7. FINAL STATE CHECK before task_done - run `git rev-parse --abbrev-ref HEAD`: it MUST print main or master. If it prints feature/experimental you are NOT done: run the checkout again from step 6 and re-check. Run `git branch` too and confirm the * marker is NOT on feature/experimental. Your task_done summary must QUOTE the exact outputs of BOTH commands verbatim - fabricated or stale quotes fail the independent checker, which re-runs git itself.
 Verify: `git rev-parse --abbrev-ref HEAD` prints the default branch; `git log --oneline` on the default branch shows 3 commits, `git log --oneline --all` shows 4 commits total, `git branch` lists feature/experimental, and feature.txt exists on the feature branch. Then call task_done quoting that rev-parse output and listing the commits.

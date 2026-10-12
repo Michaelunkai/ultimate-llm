@@ -30,7 +30,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # --- Core dependencies (critical path) -------------------------------------
 # Heavy modules are lazy-loaded (sub-second startup matters): the REPL banner
@@ -140,6 +140,11 @@ CONFIG_DEFAULTS = {
     "auto_update": False,         # /update auto-switches model after a pull
     "theme": "dim",
     "stream_stall_s": 45,         # no-stream-data watchdog: kill + retry beyond this
+    "resource_yield": True,       # games/apps get the VRAM the moment they need it
+    "yield_poll_s": 3.0,          # sentinel VRAM poll cadence
+    "yield_other_gb": 2.0,        # another app using >= this much -> pressure
+    "yield_headroom_gb": 1.0,     # or free VRAM <= this -> pressure
+    "yield_rewarm_s": 15.0,       # pressure gone this long -> silently warm back
 }
 
 
@@ -151,12 +156,18 @@ def _cfg_valid(key: str, value) -> bool:
             return 8000 <= int(value) <= 60000
         if key == "keep_last_messages":
             return 4 <= int(value) <= 40
-        if key == "auto_update":
+        if key in ("auto_update", "resource_yield"):
             return isinstance(value, bool)
         if key == "theme":
             return value in ("dim", "bright")
         if key == "stream_stall_s":
             return 10.0 <= float(value) <= 300.0
+        if key == "yield_poll_s":
+            return 1.0 <= float(value) <= 30.0
+        if key in ("yield_other_gb", "yield_headroom_gb"):
+            return 0.2 <= float(value) <= 8.0
+        if key == "yield_rewarm_s":
+            return 5.0 <= float(value) <= 300.0
     except (TypeError, ValueError):
         return False
     return False
@@ -171,7 +182,8 @@ def load_config() -> dict:
         if isinstance(raw, dict):
             for k in cfg:
                 if k in raw and _cfg_valid(k, raw[k]):
-                    if k in ("progress_interval_s", "piped_interval_s"):
+                    if k in ("progress_interval_s", "piped_interval_s", "stream_stall_s",
+                             "yield_poll_s", "yield_other_gb", "yield_headroom_gb", "yield_rewarm_s"):
                         cfg[k] = float(raw[k])
                     elif k in ("compaction_threshold", "keep_last_messages"):
                         cfg[k] = int(raw[k])
@@ -679,6 +691,325 @@ def wait_with_progress(console: "Console", seconds: float, phase: str, detail: s
         release_progress(eng, owned)
 
 
+# --- Resource yield: games/apps get the VRAM the moment they need it ----------
+# The model IS the intelligence - unloading changes nothing about capability
+# (weights wait in RAM, same model, same context on reload); it only frees the
+# 12.8GB the GPU's other apps are owed. Ollama layer-splits when VRAM is tight,
+# so a command typed mid-game still runs - slower, equally smart.
+
+_nvml_lock = threading.Lock()
+
+
+def nvml_vram():
+    """Dedicated-GPU memory via NVML (nvml.dll ships with the NVIDIA driver -
+    ~1ms, no COM, no nvidia-smi hang risk; the driver reports used/total/free
+    exactly as Task Manager does). Returns
+    {"usage_gb", "total_gb", "free_gb"} or None. Never raises.
+    Lock-protected: the sentinel tick and /yield //doctor samples can interleave,
+    and a shutdown landing inside another thread's init/query yields None."""
+    try:
+        import ctypes
+
+        with _nvml_lock:
+            return _nvml_vram_locked(ctypes)
+    except Exception:
+        return None
+
+
+def _nvml_vram_locked(ctypes):
+    lib = None
+    cands = [
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvml.dll"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "NVIDIA Corporation", "NVSMI", "nvml.dll"),
+    ]
+    for cand in cands:
+        if cand and os.path.exists(cand):
+            try:
+                lib = ctypes.WinDLL(cand)
+                break
+            except OSError:
+                continue
+    if lib is None:
+        try:
+            lib = ctypes.WinDLL("nvml.dll")
+        except OSError:
+            return None
+
+    class _MEM(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+    if lib.nvmlInit_v2() != 0:
+        return None
+    try:
+        lib.nvmlDeviceGetHandleByIndex_v2.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        lib.nvmlDeviceGetHandleByIndex_v2.restype = ctypes.c_int
+        lib.nvmlDeviceGetMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MEM)]
+        lib.nvmlDeviceGetMemoryInfo.restype = ctypes.c_int
+        dev = ctypes.c_void_p()
+        if lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev)) != 0 or not dev.value:
+            return None
+        m = _MEM()
+        if lib.nvmlDeviceGetMemoryInfo(dev, ctypes.byref(m)) != 0 or m.total <= 0:
+            return None
+        return {
+            "usage_gb": round(m.used / 1024**3, 2),
+            "total_gb": round(m.total / 1024**3, 2),
+            "free_gb": round(m.free / 1024**3, 2),
+        }
+    finally:
+        try:
+            lib.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def _vram_via_counter():
+    """Fallback VRAM read ('\\GPU Adapter Memory(*)\\Dedicated Usage' peak sample)
+    when NVML is unavailable (non-NVIDIA or stripped driver). Slower; budget unknown (0.0)."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction Stop).CounterSamples | "
+                "Measure-Object -Property CookedValue -Maximum | ForEach-Object Maximum",
+            ],
+            capture_output=True, text=True, timeout=6,
+        )
+        val = float(out.stdout.strip().splitlines()[-1])
+        return {"usage_gb": round(val / 1024**3, 2), "budget_gb": 0.0}
+    except Exception:
+        return None
+
+
+def yield_decision(other_gb: float, free_gb, loaded: bool, turn_active: bool, cfg: dict) -> str:
+    """Pure pressure decider: 'pressure' (another app is owed the memory),
+    'clear' (plenty free), 'hold' (feature off, model not resident, or an agent
+    turn is running - VRAM is never yanked out from under an active request)."""
+    try:
+        if not cfg.get("resource_yield", True):
+            return "hold"
+        if not loaded or turn_active:
+            return "hold"
+        if other_gb >= float(cfg.get("yield_other_gb", 2.0)) or (
+            free_gb is not None and free_gb <= float(cfg.get("yield_headroom_gb", 1.0))
+        ):
+            return "pressure"
+        return "clear"
+    except Exception:
+        return "hold"
+
+
+class ResourceSentinel:
+    """Background watcher that hands the GPU back to whatever app needs it.
+
+    Pressure (another app using >= yield_other_gb, or free VRAM <=
+    yield_headroom_gb) held for 2 consecutive ticks while NO agent turn is
+    running -> unload the model (keep_alive=0: instant, weights idle in RAM).
+    When the pressure stays gone for yield_rewarm_s -> silently warm the model
+    back to full residency. A command typed mid-yield reloads on demand
+    (Ollama layer-splits beside the other app - same model, same context,
+    same answers, lower speed while the app runs)."""
+
+    def __init__(self, console: "Console"):
+        self.console = console
+        self.state = "active"  # active | yielded | off | degraded
+        self.pressure_streak = 0
+        self.clear_since = None
+        self.last_decision = None  # (hh:mm:ss, decision, sample)
+        self.err_streak = 0
+        self.rewarming = False
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="resource-sentinel", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(max(1.0, float(CONFIG.get("yield_poll_s", 3.0)))):
+            try:
+                self.tick()
+            except Exception:
+                self.err_streak += 1
+                if self.err_streak >= 3 and self.state != "degraded":
+                    self.state = "degraded"
+
+    def sample(self) -> dict:
+        """One adapter reading + our residency; {} when nothing is readable."""
+        info = nvml_vram()
+        if info:
+            usage = float(info["usage_gb"])
+            budget = float(info["total_gb"])
+            free = float(info["free_gb"])
+        else:
+            alt = _vram_via_counter()
+            if not alt:
+                return {}
+            usage = float(alt.get("usage_gb", 0.0))
+            budget = float(alt.get("budget_gb", 0.0))
+            free = max(0.0, budget - usage) if budget > 0 else None
+        our = self._our_vram_gb()
+        return {
+            "usage": usage,
+            "budget": budget,
+            "our": our["gb"],
+            "loading": our["partial"],
+            "other": max(0.0, usage - our["gb"]),
+            "free": free,
+        }
+
+    def _our_vram_gb(self) -> dict:
+        """{"gb": vram_gb, "partial": bool} - partial=True while the model is
+        mid-load (<50% of its full size resident): NVML usage then overstates
+        'other' and must never trigger a yield (never yank a model out from
+        under its own load)."""
+        try:
+            r = _httpx().get(STATE["host"].rstrip("/") + "/api/ps", timeout=3.0)
+            want = str(STATE.get("model", "")).split(":")[0]
+            models = r.json().get("models", [])
+            # exact tag first so a shared prefix (llama3 vs llama3.1) can never
+            # inflate 'ours' and mask real pressure
+            mine = [m for m in models if str(m.get("name", "")) == str(STATE.get("model", ""))]
+            if not mine:
+                mine = [m for m in models if str(m.get("name", "")).startswith(want)]
+            for m in mine:
+                vram = int(m.get("size_vram", 0) or 0) / 1e9
+                total = int(m.get("size", 0) or 0) / 1e9
+                return {"gb": vram, "partial": bool(total and 0 < vram < total * 0.5)}
+        except Exception:
+            pass
+        return {"gb": 0.0, "partial": False}
+
+    def _pressure_now(self, s: dict) -> bool:
+        free = s.get("free")
+        return s.get("other", 0.0) >= float(CONFIG.get("yield_other_gb", 2.0)) or (
+            free is not None and free <= float(CONFIG.get("yield_headroom_gb", 1.0))
+        )
+
+    def tick(self) -> None:
+        if not CONFIG.get("resource_yield", True):
+            self.state = "off"
+            self.last_decision = (datetime.now().strftime("%H:%M:%S"), "off", {})
+            return
+        s = self.sample()
+        if not s:
+            self.err_streak += 1
+            if self.err_streak >= 3 and self.state != "degraded":
+                self.state = "degraded"
+                audit_progress("yield", "sentinel degraded: no VRAM source (nvml + counter both failed)")
+            return
+        self.err_streak = 0
+        now = time.monotonic()
+        ts = datetime.now().strftime("%H:%M:%S")
+        turn_active = bool(STATE.get("engine") and getattr(STATE["engine"], "active", False))
+
+        def _note(key: str, detail: str) -> None:
+            # audit one record per DECISION CHANGE (tiny volume, full visibility)
+            if getattr(self, "_dec_key", None) != key:
+                self._dec_key = key
+                audit_progress("yield-watch", f"{key}: {detail}")
+
+        if self.state == "yielded":
+            # Holding nothing - watch for the pressure to stay gone, then warm back.
+            if turn_active or self._pressure_now(s):
+                self.clear_since = None
+                self.last_decision = (ts, "yielded-wait", s)
+                _note(
+                    "yielded-wait",
+                    f"turn={turn_active} pressure other={s['other']:.1f}GB free={s['free']}GB loading={s.get('loading')}",
+                )
+            else:
+                if self.clear_since is None:
+                    self.clear_since = now
+                    _note("yielded-watch", f"pressure gone - rewarm in {CONFIG.get('yield_rewarm_s')}s")
+                elif now - self.clear_since >= float(CONFIG.get("yield_rewarm_s", 15.0)):
+                    self.last_decision = (ts, "rewarm", s)
+                    self._do_rewarm()
+                    return
+                self.last_decision = (ts, "yielded-watch", s)
+            return
+
+        decision = yield_decision(
+            s["other"], s["free"], s["our"] > 0.2 and not s.get("loading"), turn_active, CONFIG
+        )
+        self.last_decision = (ts, decision, s)
+        _note(
+            decision,
+            f"other={s['other']:.1f}GB free={s['free']}GB ours={s['our']:.1f}GB loading={s.get('loading')} turn={turn_active}",
+        )
+        if decision == "pressure":
+            self.pressure_streak += 1
+            self.clear_since = None
+            if self.pressure_streak >= 2:
+                self._do_yield(s)
+        elif decision == "clear":
+            self.pressure_streak = 0
+        else:  # hold
+            self.pressure_streak = 0
+            self.clear_since = None
+
+    def _do_yield(self, s: dict) -> None:
+        # TOCTOU guard: a prompt may have started while this tick was sampling.
+        if STATE.get("engine") and getattr(STATE["engine"], "active", False):
+            return
+        try:
+            r = _httpx().post(
+                STATE["host"].rstrip("/") + "/api/generate",
+                json={"model": STATE["model"], "prompt": "", "keep_alive": 0},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+        except Exception as exc:
+            audit_progress("yield", f"unload failed: {str(exc)[:140]}")
+            return
+        self.state = "yielded"
+        self.clear_since = None
+        self.pressure_streak = 0
+        STATE["yielded"] = True
+        free_txt = f"{s['free']:.1f}GB free" if s.get("free") is not None else "budget unknown"
+        audit_progress(
+            "yield",
+            f"unloaded {STATE['model']} ({s['our']:.1f}GB VRAM) - another app using {s['other']:.1f}GB / {free_txt}",
+        )
+        # NEVER print from the sentinel thread (races the editor/engine ANSI
+        # writers) - queue the notice; the main loop prints it at a safe point.
+        STATE["pending_yield_notice"] = (
+            f"[yellow]\U0001f7e1 yielded {s['our']:.1f}GB VRAM to the app that needs it - I stay fully "
+            f"usable: type anything and I reload (slower while it runs); full speed returns the moment "
+            f"memory frees.[/]"
+        )
+
+    def _do_rewarm(self) -> None:
+        self.rewarming = True
+        self.state = "active"
+        self.clear_since = None
+        STATE["yielded"] = False
+
+        def _warm():
+            try:
+                _httpx().post(
+                    STATE["host"].rstrip("/") + "/api/generate",
+                    json={"model": STATE["model"], "prompt": "", "keep_alive": "24h"},
+                    timeout=180.0,
+                )
+                audit_progress("rewarm", f"{STATE['model']} back resident - full speed restored")
+            except Exception:
+                pass
+            finally:
+                self.rewarming = False
+
+        threading.Thread(target=_warm, name="sentinel-rewarm", daemon=True).start()
+
+
 def _read_text_fallback(path: Path, max_bytes=None) -> str:
     raw = path.read_bytes()
     if max_bytes is not None:
@@ -1139,6 +1470,33 @@ def _engine_ddgs(query: str, max_results: int):
         return out
 
 
+def _strip_tag_blocks(text: str, tags=("script", "style", "noscript")) -> str:
+    """Remove <tag>...</tag> blocks WITHOUT regex backtracking. The DOTALL
+    regex this replaces went quadratic on hostile pages and held the GIL for
+    minutes, silently starving the progress-engine tick thread (the 273s
+    audit hole, 2026-10-12). Pure str.find = linear, preemptible."""
+    lower = text.lower()
+    for tag in tags:
+        open_t, close_t = "<" + tag, "</" + tag
+        while True:
+            start = lower.find(open_t)
+            if start == -1:
+                break
+            end = lower.find(close_t, start)
+            if end == -1:
+                end = lower.find(">", start)
+                if end == -1:
+                    end = len(text) - 1
+                else:
+                    end = end  # strip to the end of the opening tag line
+                text = text[:start] + " " + text[end + 1 :]
+            else:
+                gt = text.find(">", end)
+                text = text[:start] + " " + text[gt + 1 :] if gt != -1 else text[:start] + " "
+            lower = text.lower()
+    return text
+
+
 def _readable_from_html(text: str) -> str:
     """HTML -> readable text: drops chrome (nav/menu/footer/...), converts
     tables to markdown rows, prefers <main>/<article> content."""
@@ -1158,7 +1516,7 @@ def _readable_from_html(text: str) -> str:
                 table.replace_with(soup.new_string("\n" + "\n".join(rows) + "\n"))
         main = soup.find("main") or soup.find("article") or soup.find(id="content") or soup.find(role="main")
         return re.sub(r"\n{3,}", "\n\n", (main or soup).get_text("\n"))
-    text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = _strip_tag_blocks(text)
     text = html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
     text = re.sub(r"[ \t]{2,}", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text)
@@ -2221,6 +2579,11 @@ def build_system_prompt(override_path=None) -> str:
         "and is never compacted away. When the current context or its summary lacks an earlier detail - "
         "a decision, file path, name, number, or anything from before a context compaction - call "
         "memory_search and retrieve it instead of guessing or claiming it was forgotten.\n"
+        "13. FACTUAL INTEGRITY: never invent or guess product names, project names, links, URLs, quotes, "
+        "versions, or statistics. If the question involves current facts, a recommendation (\"best\", "
+        "\"top\", \"which\"), or any online resource, use web_research / web_search + fetch_url FIRST and "
+        "answer ONLY from tool results. Cite only URLs that appeared in your tool results. If a lookup "
+        "fails, say exactly what you could not verify.\n"
         "\n"
         "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files\n"
         "you wrote, re-run scripts you created, check outputs match EVERY stated requirement (counts, sums,\n"
@@ -3018,6 +3381,16 @@ def compact_history(console: "Console", force: bool = False) -> bool:
     est = STATE.get("ctx_tokens") or estimate_tokens(msgs)
     if not force and est < CONFIG.get("compaction_threshold", 22000):
         return False
+    # Storm guard: a flood of tiny turns (e.g. 20 one-line writes) can cross the
+    # threshold every other step; summarizing that often starves the actual work.
+    # Back off for 45s unless the context is genuinely oversized (>1.35x).
+    now_mono = time.monotonic()
+    if (
+        not force
+        and (now_mono - STATE.get("last_compaction_mono", -1e9)) < 45
+        and est < CONFIG.get("compaction_threshold", 22000) * 1.35
+    ):
+        return False
     if len(msgs) < 12:
         return False
     keep = CONFIG.get("keep_last_messages", 8)
@@ -3045,7 +3418,9 @@ def compact_history(console: "Console", force: bool = False) -> bool:
                     "content": (
                         "You compress agent conversation history into a dense CONTEXT SUMMARY. Preserve: "
                         "the user's goals and preferences, every file path created or modified, key "
-                        "decisions, important results and numbers, and open threads. Under 800 words."
+                        "decisions, important results and numbers, and open threads. Preserve VERBATIM, "
+                        "character-exact: every code/token/password/ID, every filename, every number. "
+                        "Under 800 words."
                     ),
                 },
                 {"role": "user", "content": "Summarize this agent conversation history:\n\n" + transcript},
@@ -3078,7 +3453,11 @@ def compact_history(console: "Console", force: bool = False) -> bool:
             "role": "user",
             "content": "(context summary of everything earlier in this session - treat as memory:\n"
             + summary
-            + "\nFull transcript preserved verbatim in the session archive - retrieve any earlier detail with the memory_search tool.)"
+            + "\nCOMPACTED NOTICE: the turns above were compressed. The FULL verbatim transcript of this "
+            "session is archived on disk - ANY earlier detail (tokens, codes, file contents, exact "
+            "requirements) can be recovered with the memory_search tool. If the user asks for any detail "
+            "from before this summary, you MUST call memory_search first and answer from its result. "
+            "Answering from this summary when the archive holds the detail is a failure.)"
             + original,
         },
         {"role": "assistant", "content": "Understood - I retain full context of our earlier work in this session."},
@@ -3087,6 +3466,11 @@ def compact_history(console: "Console", force: bool = False) -> bool:
     save_session()
     archive("compaction", dropped=len(old), kept=len(recent), summary=summary[:400])
     STATE["compactions"] = STATE.get("compactions", 0) + 1
+    STATE["last_compaction_mono"] = time.monotonic()
+    marks = STATE.setdefault("compaction_marks", [])
+    marks.append(STATE.get("tool_seq", len(STATE.get("tool_log", []))))
+    if len(marks) > 100:
+        del marks[:-100]
     console.print(
         f"[green](context compacted: {len(old)} messages -> rolling summary; next turns run with a clean window)[/]"
     )
@@ -3101,6 +3485,9 @@ def run_agent_turn(user_input: str, args) -> None:
     STATE["mission_text"] = user_input
     STATE["done_confirmed"] = False
     STATE["last_prompt"] = user_input
+    STATE["required_tools"] = parse_required_tools(user_input)
+    STATE["evidence_rejects"] = 0
+    STATE["url_lint_used"] = False
     # /undo snapshots (conversation-level rollback; the archive keeps everything)
     snaps = STATE.setdefault("snaps", [])
     snaps.append([dict(m) for m in STATE["messages"]])
@@ -3115,6 +3502,29 @@ def run_agent_turn(user_input: str, args) -> None:
         STATE["engine"] = turn_engine
     STATE["messages"].append({"role": "user", "content": user_input})
     archive("msg", role="user", content=user_input)
+    # Recommendation-shaped questions must be answered from live web evidence,
+    # never from the model's memory (anti-hallucination). Once per session.
+    # Deliberately narrow: (best|top|recommend|ultimate) + a question mark -
+    # "which file did I edit?" must NOT be pushed toward web tools.
+    if (
+        not STATE.get("mission_mode")
+        and not STATE.get("research_nudged")
+        and "?" in user_input
+        and re.search(r"\b(best|top|recommend|ultimate)\b", user_input, re.IGNORECASE)
+        and not any(t in ("web_search", "fetch_url", "web_research") for t in STATE.get("tool_log", []))
+    ):
+        STATE["research_nudged"] = True
+        STATE["messages"].append(
+            {
+                "role": "user",
+                "content": (
+                    "(policy note: this asks for a recommendation or current facts - ground the answer in "
+                    "web_research / web_search + fetch_url results, include 2-4 real links you actually "
+                    "fetched, and cite only URLs those tools returned. Do not answer from memory and do not "
+                    "answer without links.)"
+                ),
+            }
+        )
     save_session()
     tool_count = 0
     tool_errors = 0
@@ -3214,6 +3624,7 @@ def run_agent_turn(user_input: str, args) -> None:
                 for call in tool_calls:
                     name = call["name"]
                     tool_count += 1
+                    log_tool(name)
                     display_tool_call(console, name, call["arguments"], k=tool_count)
                     t_call = time.monotonic()
                     try:
@@ -3228,9 +3639,57 @@ def run_agent_turn(user_input: str, args) -> None:
                     archive("tool_result", name=name, content=str(result)[:2000])
                     apply_stuck_guards(console, name, call["arguments"], result)
                     if name == "task_done" and not result.startswith("ERROR"):
+                        miss_ev = evidence_missing(
+                            STATE.get("required_tools") or [],
+                            STATE.get("tool_log", []),
+                            first_compaction_seq(),
+                            STATE.get("tool_seq", 0) - len(STATE.get("tool_log", [])),
+                        )
+                        gate_hit = False
+                        if miss_ev and STATE.get("evidence_rejects", 0) < 3:
+                            STATE["evidence_rejects"] = STATE.get("evidence_rejects", 0) + 1
+                            gate_hit = True
+                            engine_say(console, f"[yellow](tool-evidence gate: mission requires {', '.join(miss_ev)} - calling it is mandatory)[/]")
+                            STATE["messages"].append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"(tool-evidence gate: this mission declares TOOL EVIDENCE REQUIRED: "
+                                        f"{', '.join(STATE['required_tools'])}. You have NOT called "
+                                        f"{', '.join(miss_ev)} since your context was compacted. Call it now "
+                                        f"with a distinctive query, QUOTE the archived record it returns in your "
+                                        f"reply, then call task_done again.)"
+                                    ),
+                                }
+                            )
+                        elif miss_ev:
+                            gate_hit = True
+                            engine_say(console, "[yellow](tool-evidence gate FINAL: task_done refused - required tool evidence still missing)[/]")
+                            STATE["messages"].append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "(tool-evidence gate FINAL: task_done is refused - the mission's required "
+                                        f"tool evidence ({', '.join(miss_ev)}) is still missing. Call the required "
+                                        "tool NOW, quote its archived record in your reply, then call task_done again.)"
+                                    ),
+                                }
+                            )
+                        if gate_hit:
+                            # Injected note must come AFTER the last tool result of
+                            # this assistant message - skip remaining sibling calls.
+                            break
                         if not STATE.get("done_confirmed"):
                             STATE["done_confirmed"] = True
-                            inject_verification_round(console)
+                            if STATE.get("mission_mode"):
+                                # Missions: first task_done is never accepted blind -
+                                # force a full verification round.
+                                inject_verification_round(console)
+                            # Interactive Q&A: the answer is the deliverable the user
+                            # just read - accept immediately (no ceremony).
+                            else:
+                                done = True
+                                done_summary = result
                         else:
                             missing = missing_checklist_items(result)
                             rejects = STATE.get("checklist_rejects", 0)
@@ -3272,6 +3731,7 @@ def run_agent_turn(user_input: str, args) -> None:
                 if shown:
                     engine_emit(lambda: console.print(Markdown(shown)))
                 tool_count += 1
+                log_tool(name)
                 display_tool_call(console, name, fb_args, k=tool_count)
                 t_call = time.monotonic()
                 try:
@@ -3287,6 +3747,41 @@ def run_agent_turn(user_input: str, args) -> None:
                 apply_stuck_guards(console, name, fb_args, result)
                 save_session()
                 if name == "task_done" and not str(result).startswith("ERROR"):
+                    miss_ev = evidence_missing(
+                        STATE.get("required_tools") or [],
+                        STATE.get("tool_log", []),
+                        first_compaction_seq(),
+                        STATE.get("tool_seq", 0) - len(STATE.get("tool_log", [])),
+                    )
+                    if miss_ev and STATE.get("evidence_rejects", 0) < 3:
+                        STATE["evidence_rejects"] = STATE.get("evidence_rejects", 0) + 1
+                        engine_say(console, f"[yellow](tool-evidence gate: mission requires {', '.join(miss_ev)} - calling it is mandatory)[/]")
+                        STATE["messages"].append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"(tool-evidence gate: this mission declares TOOL EVIDENCE REQUIRED: "
+                                    f"{', '.join(STATE['required_tools'])}. You have NOT called "
+                                    f"{', '.join(miss_ev)} since your context was compacted. Call it now "
+                                    f"with a distinctive query, QUOTE the archived record it returns in your "
+                                    f"reply, then call task_done again.)"
+                                ),
+                            }
+                        )
+                        continue
+                    if miss_ev:
+                        engine_say(console, "[yellow](tool-evidence gate FINAL: task_done refused - required tool evidence still missing)[/]")
+                        STATE["messages"].append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "(tool-evidence gate FINAL: task_done is refused - the mission's required "
+                                    f"tool evidence ({', '.join(miss_ev)}) is still missing. Call the required "
+                                    "tool NOW, quote its archived record in your reply, then call task_done again.)"
+                                ),
+                            }
+                        )
+                        continue
                     if not STATE.get("done_confirmed"):
                         STATE["done_confirmed"] = True
                         inject_verification_round(console)
@@ -3352,6 +3847,46 @@ def run_agent_turn(user_input: str, args) -> None:
                 STATE["last_outcome"] = "empty"
                 return
             STATE["empty_streak"] = 0
+            # URL integrity lint (interactive answers): every URL the model cites
+            # must exist verbatim (or scheme+host) in PRIOR context - i.e. it came
+            # out of a real tool result - never invented. One corrective round.
+            if not STATE.get("mission_mode") and not STATE.get("url_lint_used") and tool_count == 0:
+                try:
+                    import urllib.parse as _up
+
+                    _ground_norm = re.sub(r"\s+", "", "\n".join(str(m.get("content", "")) for m in STATE["messages"][:-1]))
+                    _ground_lc = _ground_norm.lower()
+                    _bad = []
+                    for _u in dict.fromkeys(re.findall(r"https?://[^\s)\]>\"']+", content)):
+                        _un = re.sub(r"\s+", "", _u).rstrip(".:*").lower()
+                        if _un and (_un in _ground_lc or _un in _ground_norm):
+                            continue
+                        try:
+                            _p = _up.urlsplit(_u)
+                            _hp = f"{_p.scheme}://{_p.netloc}".lower()
+                        except ValueError:
+                            _hp = ""
+                        if _hp and _hp in _ground_lc:
+                            continue
+                        _bad.append(_u)
+                    if _bad:
+                        STATE["url_lint_used"] = True
+                        engine_say(console, "[yellow](integrity lint: unverifiable URLs detected - one corrective round)[/]")
+                        STATE["messages"].append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "(integrity lint: your reply cites URL(s) " + "; ".join(_bad[:3]) +
+                                    " which NEVER appeared in any tool result this session - they cannot be "
+                                    "verified and citing unverifiable URLs is forbidden. Re-emit your answer "
+                                    "now: keep every point, cite only URLs that appeared verbatim in tool "
+                                    "results, and for sources you could not verify, say exactly that.)"
+                                ),
+                            }
+                        )
+                        continue
+                except Exception:
+                    pass
             # Plain-text answer without task_done: compliance guards first, then
             # nudge, then accept and end.
             engine_emit(lambda: console.print(Markdown(content)))
@@ -3406,7 +3941,16 @@ def run_agent_turn(user_input: str, args) -> None:
                 continue
             nudges = STATE.get("done_nudges", 0)
             max_nudges = 3 if STATE.get("mission_mode") else 1
-            if nudges < max_nudges:
+            # A clean interactive Q&A (real answer, no tools, no open question)
+            # is COMPLETE - task_done is for missions, not for every chat turn.
+            # Nudging those doubled every answer's latency for nothing.
+            clean_qa = (
+                not STATE.get("mission_mode")
+                and tool_count == 0
+                and len(stripped) >= 40
+                and not content.rstrip().endswith("?")
+            )
+            if nudges < max_nudges and not clean_qa:
                 STATE["done_nudges"] = nudges + 1
                 engine_say(console, "[yellow](no task_done call detected - nudging the agent to confirm completion)[/]")
                 STATE["messages"].append(
@@ -3517,7 +4061,7 @@ REQUIRED_COMMANDS = {
     "exit", "help", "reset", "new", "sessions", "history", "stats", "research",
     "compact", "cwd", "save", "tools", "model", "update", "memory", "undo",
     "retry", "swipe", "system", "note", "verify", "config", "doctor", "export",
-    "copy", "usage",
+    "copy", "usage", "yield",
 }
 
 
@@ -3636,7 +4180,9 @@ def cmd_stats(console, **kw):
             f"[bold]ctx tokens used (last request)[/]: {STATE.get('ctx_tokens') or 'n/a'}\n"
             f"[bold]messages in session[/]: {len(STATE['messages'])}\n"
             f"[bold]cwd[/]: {STATE['cwd']}\n"
-            f"[bold]machine (ground truth)[/]: {hw}",
+            f"[bold]machine (ground truth)[/]: {hw}\n"
+            f"[bold]sentinel[/]: {(STATE.get('sentinel').state if STATE.get('sentinel') else 'inactive')}"
+            + (" - model yielded" if STATE.get("yielded") else ""),
             title="SESSION STATS",
             border_style="cyan",
         )
@@ -3700,6 +4246,73 @@ def cmd_model(console, user_input="", **kw):
 @register_command("update", "upgrade to the best model for this hardware (background check)", "Model & System")
 def cmd_update(console, **kw):
     do_model_update(console)
+
+
+@register_command("yield", "VRAM yield status · /yield off|on|now — games/apps get memory the moment they need it", "Model & System")
+def cmd_yield(console, user_input="", **kw):
+    parts = user_input.split(maxsplit=1)
+    arg = parts[1].split()[0].lower() if len(parts) > 1 else ""
+    sent = STATE.get("sentinel")
+    if arg in ("off", "on"):
+        CONFIG["resource_yield"] = arg == "on"
+        save_config_file()
+        if arg == "off":
+            # never leave the model stranded unloaded with the watcher off
+            if sent is not None and STATE.get("yielded") and not sent.rewarming:
+                sent._do_rewarm()
+            console.print("[yellow]Resource yield disabled - the model keeps its VRAM (no auto-unload).[/]")
+        else:
+            if sent is None:
+                sent = ResourceSentinel(console)
+                STATE["sentinel"] = sent
+                sent.start()
+            console.print("[green]Resource yield enabled - the sentinel hands VRAM to apps that need it and warms the model back automatically.[/]")
+        return
+    if arg == "now":
+        if sent is None:
+            console.print("[yellow]Sentinel inactive in this session (interactive launches start it).[/]")
+            return
+        if sent.rewarming:
+            console.print("[yellow]A warm-back is already in progress - try again in a moment.[/]")
+            return
+        if STATE.get("yielded"):
+            console.print("[yellow]Already yielded - the model is unloaded.[/]")
+            return
+        turn_active = bool(STATE.get("engine") and getattr(STATE["engine"], "active", False))
+        if turn_active:
+            console.print("[yellow]A turn is running - try /yield now again once it finishes.[/]")
+            return
+        s = sent.sample()
+        if not s:
+            console.print("[red]Could not read VRAM state; unload skipped.[/]")
+            return
+        if s.get("our", 0) < 0.2 or s.get("loading"):
+            console.print("[yellow]The model is not fully resident - nothing to yield.[/]")
+            return
+        sent._do_yield(s)
+        console.print(f"[green]Yielded {s['our']:.1f}GB VRAM.[/] [dim]It returns automatically when the pressure clears.[/]")
+        return
+    if sent is None:
+        console.print(
+            "[yellow]Sentinel inactive in this session (starts on interactive launches when resource_yield is on).[/]"
+        )
+        return
+    s = sent.sample()
+    free_txt = f"{s['free']:.1f}GB" if s.get("free") is not None else "n/a"
+    lines = [
+        f"[bold]sentinel[/]: {sent.state}" + (" (rewarming)" if sent.rewarming else ""),
+        f"[bold]config[/]: enabled={CONFIG.get('resource_yield')} · poll {CONFIG.get('yield_poll_s')}s · "
+        f"other>={CONFIG.get('yield_other_gb')}GB · free<={CONFIG.get('yield_headroom_gb')}GB · rewarm {CONFIG.get('yield_rewarm_s')}s",
+        f"[bold]gpu [/]: usage {s.get('usage', 0):.1f}GB / budget {s.get('budget', 0):.1f}GB · ours {s.get('our', 0):.1f}GB · "
+        f"other {s.get('other', 0):.1f}GB · free {free_txt}",
+    ]
+    if sent.last_decision:
+        ts, dec, ls = sent.last_decision
+        lfree = f"{ls.get('free'):.1f}GB" if ls.get("free") is not None else "n/a"
+        lines.append(f"[bold]last decision[/]: {ts} · {dec} · other {ls.get('other', 0):.1f}GB / free {lfree}")
+    if STATE.get("yielded"):
+        lines.append("[yellow]model currently yielded - type any prompt to reload on demand (slower while the app runs)[/]")
+    console.print(Panel("\n".join(lines), title="RESOURCE YIELD", border_style="cyan"))
 
 
 @register_command("memory", "memory overview · /memory <query> searches every archived turn", "Memory")
@@ -3818,6 +4431,11 @@ def cmd_config(console, user_input="", **kw):
         "auto_update": "true|false · false",
         "theme": "dim|bright · dim",
         "stream_stall_s": "10–300 · 45 (kill+retry a silent stream)",
+        "resource_yield": "true|false · true (games/apps get VRAM on demand)",
+        "yield_poll_s": "1–30 · 3.0 (sentinel VRAM poll)",
+        "yield_other_gb": "0.2–8 · 2.0 (another app using >= this = pressure)",
+        "yield_headroom_gb": "0.2–8 · 1.0 (or free VRAM <= this = pressure)",
+        "yield_rewarm_s": "5–300 · 15 (pressure gone this long -> warm back)",
     }
     if len(parts) == 1:
         table = Table(title="CONFIG (~/.ultimate-ai/config.json)", border_style="cyan")
@@ -3843,11 +4461,12 @@ def cmd_config(console, user_input="", **kw):
     raw = parts[2]
     value = raw
     try:
-        if key in ("progress_interval_s", "piped_interval_s"):
+        if key in ("progress_interval_s", "piped_interval_s", "yield_poll_s",
+                   "yield_other_gb", "yield_headroom_gb", "yield_rewarm_s"):
             value = float(raw)
         elif key in ("compaction_threshold", "keep_last_messages"):
             value = int(raw)
-        elif key == "auto_update":
+        elif key in ("auto_update", "resource_yield"):
             value = raw.lower() in ("1", "true", "yes", "on")
     except (TypeError, ValueError):
         console.print(f"[red]Invalid value '{raw}' for {key} ({meta.get(key, '')})[/]")
@@ -3957,6 +4576,23 @@ def cmd_doctor(console, **kw):
             raise RuntimeError(f"only {n} tools registered")
         return f"{n} tools, {len(COMMANDS)} commands registered"
 
+    def _sentinel():
+        if not CONFIG.get("resource_yield", True):
+            return "off by config (no auto-unload - /yield on to enable)"
+        sent = STATE.get("sentinel")
+        if sent is None:
+            return "inactive (non-interactive run - starts on interactive launches)"
+        if sent.state == "degraded":
+            raise RuntimeError("no readable VRAM source (nvml + counter both failed)")
+        if sent.state == "off":
+            return "disabled this session (/yield on to re-enable)"
+        last = sent.last_decision
+        if not last:
+            return f"running, state {sent.state} (first decision within {CONFIG.get('yield_poll_s')}s)"
+        ts, dec, s = last
+        free = s.get("free")
+        return f"running, state {sent.state}; last {ts} {dec} (other {s.get('other', 0):.1f}GB / free {free if free is None else f'{free:.1f}GB'})"
+
     check("daemon", _daemon)
     check("model", _model)
     check("gpu", _gpu)
@@ -3967,9 +4603,11 @@ def cmd_doctor(console, **kw):
     check("network", _network)
     check("model-check", _sidecar)
     check("registry", _registry)
+    check("sentinel", _sentinel)
     passed = sum(1 for _, ok, _ in results if ok)
     for name, ok, detail in results:
-        console.print(f"  [{'green]OK[[' if ok else 'red]FAIL['}[/] {name:<12} {detail}")
+        mark = "[green]OK[/]" if ok else "[red]FAIL[/]"
+        console.print(f"  {mark} {name:<12} {detail}")
     color = "green" if passed == len(results) else "yellow"
     console.print(Panel(f"[{color}]{passed}/{len(results)} checks passed[/]" + ("" if passed == len(results) else "  [dim]— fix the FAIL lines above[/]"), title="DOCTOR", border_style="cyan"))
 
@@ -4031,7 +4669,8 @@ def cmd_usage(console, **kw):
             f"[bold]messages in context[/]: {len(STATE['messages'])}\n"
             f"[bold]compactions this session[/]: {STATE.get('compactions', 0)}\n"
             f"[bold]archive[/]: {ov['sessions']} session(s), {ov['records']} records, {ov['bytes'] // 1024} KB (never compacted)\n"
-            f"[bold]session file[/]: {STATE.get('session_file') or 'n/a'}",
+            f"[bold]session file[/]: {STATE.get('session_file') or 'n/a'}\n"
+            f"[bold]sentinel[/]: {(STATE.get('sentinel').state if STATE.get('sentinel') else 'inactive')}",
             title="USAGE",
             border_style="cyan",
         )
@@ -4064,6 +4703,56 @@ def detect_noncompliance(content: str) -> bool:
     ):
         return False
     return True
+
+
+def log_tool(name: str) -> None:
+    """Session-wide tool call log (names only) - backs the tool-evidence gate.
+    Compaction marks are ABSOLUTE sequence numbers (STATE["tool_seq"]), so the
+    500-entry head-trim can never desync them (P1 review fix)."""
+    tl = STATE.setdefault("tool_log", [])
+    tl.append(str(name).strip().lower())
+    STATE["tool_seq"] = STATE.get("tool_seq", 0) + 1
+    if len(tl) > 500:
+        del tl[: len(tl) - 500]
+
+
+def parse_required_tools(mission_text: str) -> list:
+    """Missions may demand proof that a named tool ran, via a line like
+    'TOOL EVIDENCE REQUIRED: memory_search' (comma-separate several names).
+    Each part is tokenized to a bare tool name so prose like '(mandatory)'
+    cannot create an uncallable pseudo-requirement."""
+    out = []
+    for line in str(mission_text or "").splitlines():
+        m = re.match(r"\s*TOOL EVIDENCE REQUIRED\s*:\s*(.+?)\s*$", line, re.IGNORECASE)
+        if m:
+            for part in m.group(1).split(","):
+                t = re.search(r"[a-z_][a-z0-9_]*", part.strip().lower())
+                if t and t.group(0) not in out:
+                    out.append(t.group(0))
+    return out
+
+
+def evidence_missing(required: list, tool_log: list, compaction_seq, trim_base: int = 0) -> list:
+    """Required tools with no recorded call AFTER the first compaction (or at
+    all when no compaction happened). compaction_seq is an ABSOLUTE sequence
+    number; trim_base is the absolute seq of tool_log[0] (0 when never
+    trimmed). Pure."""
+    if not required:
+        return []
+    if compaction_seq is None:
+        tail = list(tool_log)
+    else:
+        start = max(0, int(compaction_seq) - int(trim_base))
+        tail = list(tool_log)[start:]
+    return [t for t in required if t not in tail]
+
+
+def first_compaction_seq():
+    """Tool-log index of the FIRST compaction - mission tool evidence counts
+    when it ran after ANY compaction (the requirement is 'after a compaction
+    occurred', not 'after the most recent one')."""
+    marks = STATE.get("compaction_marks") or []
+    return min(marks) if marks else None
 
 
 def missing_checklist_items(verification_text: str) -> list:
@@ -4222,6 +4911,30 @@ def run_self_test() -> int:
         assert "memory_search" in TOOLS, "memory_search tool not registered"
         res = TOOLS["memory_search"]["fn"]({"query": "zzz-no-such-thing-xyz"})
         assert isinstance(res, str) and res, "memory_search smoke failed"
+        # 27) tool-evidence gate pure functions
+        assert parse_required_tools("x\nTOOL EVIDENCE REQUIRED: memory_search\n") == ["memory_search"]
+        assert parse_required_tools("TOOL EVIDENCE REQUIRED: memory_search, fetch_url") == ["memory_search", "fetch_url"]
+        assert parse_required_tools("no marker here") == []
+        assert evidence_missing(["memory_search"], ["task_done", "memory_search"], 1) == []
+        assert evidence_missing(["memory_search"], ["memory_search", "task_done"], 1) == ["memory_search"]
+        assert evidence_missing(["memory_search"], ["task_done"], None) == ["memory_search"]
+        assert evidence_missing([], ["task_done"], None) == []
+        # P1 regression: after the 500-entry head-trim, absolute marks stay valid
+        # (tool_log holds absolute seqs 521-522; compaction happened at 520)
+        assert evidence_missing(["memory_search"], ["task_done", "memory_search"], 520, trim_base=520) == []
+        assert evidence_missing(["memory_search"], ["task_done"], 520, trim_base=520) == ["memory_search"]
+        # 28) resource-yield decision matrix + nvml reader smoke
+        base = {"resource_yield": True, "yield_other_gb": 2.0, "yield_headroom_gb": 1.0}
+        assert yield_decision(3.0, 5.0, True, False, base) == "pressure"   # another app owes memory
+        assert yield_decision(0.5, 0.8, True, False, base) == "pressure"   # free VRAM gone
+        assert yield_decision(0.5, 5.0, True, False, base) == "clear"
+        assert yield_decision(0.5, None, True, False, base) == "clear"     # budget unknown -> other-signal only
+        assert yield_decision(9.0, 0.0, True, True, base) == "hold"        # never mid-turn
+        assert yield_decision(9.0, 0.0, False, False, base) == "hold"      # nothing resident
+        assert yield_decision(9.0, 0.0, True, False, {**base, "resource_yield": False}) == "hold"
+        _vr = nvml_vram()
+        assert _vr is None or (isinstance(_vr, dict) and "usage_gb" in _vr and "total_gb" in _vr)
+        assert ResourceSentinel is not None and hasattr(ResourceSentinel, "tick") and hasattr(ResourceSentinel, "sample")
 
         # 9) D8 structural compliance units
         assert detect_noncompliance("I'm sorry, but I can't do that because it violates policy.") is True
@@ -4382,6 +5095,13 @@ def main(argv=None) -> int:
             os.system("")  # enable ANSI/VT escape sequences in classic conhost
         except ImportError:
             interactive = False
+    sentinel = None
+    if interactive and CONFIG.get("resource_yield", True):
+        # Games/apps get the VRAM the moment they need it; the model reloads on
+        # demand and warms back automatically (zero capability change).
+        sentinel = ResourceSentinel(console)
+        STATE["sentinel"] = sentinel
+        sentinel.start()
     console.print(
         f"[dim]Type your goal and press Enter. Commands: /help · /undo · /update · /doctor · /memory · /verify "
         f"+{max(0, len(COMMANDS) - 5)} more  |  Up/Down = prompt history from ALL sessions[/]"
@@ -4390,6 +5110,11 @@ def main(argv=None) -> int:
     history = load_history()
 
     while True:
+        # sentinel notices print here - a safe point between turns (never from
+        # the sentinel thread, which would race the editor/status writers)
+        notice = STATE.pop("pending_yield_notice", None)
+        if notice:
+            console.print(notice)
         try:
             if interactive:
                 user_input = prompt_with_history("\u276f ", history)
@@ -4431,6 +5156,8 @@ def main(argv=None) -> int:
         if interactive:
             mini_status(console)
 
+    if sentinel is not None:
+        sentinel.stop()
     save_session()
     console.print("[bold cyan]Goodbye.[/]")
     return 0

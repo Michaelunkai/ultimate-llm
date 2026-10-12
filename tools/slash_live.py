@@ -163,9 +163,9 @@ def main() -> int:
         return False
 
     checks = [
-        ("/help", "COMMANDS (26)"),
+        ("/help", "COMMANDS (26)|COMMANDS (27)"),
         ("/stats", "SESSION STATS"),
-        ("/tools", "Tools (26)"),
+        ("/tools", "Tools (26)|Tools (27)"),
         ("/usage", "USAGE"),
         ("/memory", "MEMORY"),
         ("/memory HAWK", "memory_search:"),

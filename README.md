@@ -128,6 +128,11 @@ did not explicitly verify every numbered requirement.
   reading instructions).
 - `open_in_browser` exists only as a visual last resort for pages that truly need interactive rendering.
 
+**Factual integrity is structural:** the system prompt forbids inventing names, links, or
+statistics; recommendation-shaped questions get a research nudge; and the anti-hallucination
+proof (`tools/qa_live.py`) requires every URL in a live answer to have come out of a real
+tool result. The agent cites what it fetched — or says exactly what it could not verify.
+
 ### Real-time progress — scroll-stable, proven ≤5s
 
 Progress never fights your scroll again. While the model thinks or a tool runs, the
@@ -161,8 +166,26 @@ The agent's working context auto-compacts on long sessions, but **every turn of 
 session is also appended verbatim to a per-session JSONL archive that is never
 compacted away**. The `memory_search` tool (and `/memory <query>`) retrieves any earlier
 turn — across all past sessions — so details from before a compaction are always
-recoverable. Compaction summaries say so explicitly, and the system prompt instructs
-the agent to search instead of guessing or claiming something was forgotten.
+recoverable. Compaction summaries say so explicitly and end with a hard instruction to
+`memory_search` anything from before the summary; missions can additionally declare
+`TOOL EVIDENCE REQUIRED: memory_search`, and the harness then **refuses task_done**
+until that tool provably ran after the last compaction. Token/codeword facts are
+preserved verbatim in every summary, and a storm guard stops compaction from thrashing
+during rapid short turns.
+
+### Resource yield — games and apps get the VRAM the moment they need it
+
+A background sentinel polls the GPU via NVML (~1 ms, no nvidia-smi) every 3 s. When
+another app (a game, a render, anything) holds ≥ `yield_other_gb` (default 2 GB) or free
+VRAM drops ≤ `yield_headroom_gb` (default 1 GB) for two consecutive polls **while no
+agent turn is running**, the model is **instantly unloaded** (`keep_alive 0`) — your app
+gets all ~12.8 GB. The AI loses zero capability: the weights wait in RAM, and the moment
+you type anything it reloads on demand (Ollama layer-splits beside the app — same model,
+same context, same answers, lower speed while the app runs). When the pressure stays
+gone for `yield_rewarm_s` (default 15 s), the model silently warms back to full speed.
+Never yields mid-turn or mid-load. `/yield` shows live state; `/yield off|on` toggles;
+`/yield now` unloads immediately; ollama also runs at BelowNormal CPU priority so
+terminals and games always win CPU fights. `/doctor` checks the sentinel (11 checks).
 
 ### Always the best model, automatically
 
@@ -172,18 +195,19 @@ delta ≥ +2, still fully in VRAM) appears, the banner tells you and **`/update`
 the whole upgrade** — background pull with live progress, atomic bootstrap-state
 rewrite, instant switch. `/doctor` reports the check status any time.
 
-### 26 slash commands
+### 27 slash commands
 
 | Session | Memory | Model & System | Info |
 |---|---|---|---|
-| `/new` `/sessions` `/save` `/reset` `/undo` `/retry` `/swipe` `/export` `/exit` | `/memory` `/note` `/history` `/compact` | `/model` `/update` `/config` `/system` `/doctor` | `/help` `/tools` `/stats` `/usage` `/research` `/cwd` `/copy` |
+| `/new` `/sessions` `/save` `/reset` `/undo` `/retry` `/swipe` `/verify` `/export` `/exit` | `/memory` `/note` `/history` `/compact` | `/model` `/update` `/yield` `/config` `/system` `/doctor` | `/help` `/tools` `/stats` `/usage` `/research` `/cwd` `/copy` |
 
-Highlights: `/undo` (roll back the last exchange), `/doctor` (10-point health check:
+Highlights: `/undo` (roll back the last exchange), `/doctor` (11-point health check:
 daemon, model, GPU, disk, deps, config, archive integrity, network, upgrade status,
-registry), `/config` (persistent settings in `~/.ultimate-ai/config.json`: progress
-cadence, compaction threshold, auto-update, theme…), `/verify` (re-verify the last
-deliverable against the original request), `/usage` (live context budget), `/export`
-(session → Markdown), `/swipe` (clear the view, keep the session).
+registry, yield sentinel), `/config` (persistent settings in
+`~/.ultimate-ai/config.json`: progress cadence, compaction threshold, yield thresholds,
+auto-update, theme…), `/verify` (re-verify the last deliverable against the original
+request), `/usage` (live context budget), `/export` (session → Markdown), `/swipe`
+(clear the view, keep the session), `/yield` (resource yield control).
 
 ---
 
@@ -230,6 +254,15 @@ python harness\harness.py --model gpt-oss:20b --num-ctx 32768 --yes --mission "@
 python missions\verify.py ALL
 ```
 
+**Resource yield, proven.** `tools/yield_proof.py` drives the full lifecycle hermetically:
+12 s of sentinel stability with zero yield events, deterministic unload + audit record + user
+notice at a lowered threshold, a command typed mid-yield answered via on-demand reload
+(34 progress ticks, max gap 2.53 s), silent auto-rewarm once the pressure clears, `/yield off`
+stays quiet, clean exit — plus two organic unload/rewarm cycles observed under real desktop
+pressure (other apps spiking 2.2–2.8 GB). And the lossless-memory gate is proven too: missions
+can declare `TOOL EVIDENCE REQUIRED: memory_search`, and the harness refuses `task_done` until
+`memory_search` provably ran after the last compaction — `tools/mem_cert.py` 3/3 PASS.
+
 ---
 
 ## 🚀 Performance
@@ -238,7 +271,7 @@ python missions\verify.py ALL
 |---|---|
 | First-ever run (bootstrap + model download) | one-time, hardware/network bound |
 | Normal launch → interactive prompt | **< 1 s** (10-run max: 558 ms) |
-| Model warm-up after launch | background, GPU, 60-min keep-alive |
+| Model warm-up after launch | background, GPU, 24-h keep-alive (weights stay resident all day) |
 
 The fast path works via a cached bootstrap state (`.bootstrap-state.json`, never
 committed). `-Full` re-runs the complete discovery/bootstrap and refreshes it — use it
@@ -267,7 +300,7 @@ after hardware changes or when you want the newest model of the day.
 | `-NoAlias` | skip the `ultimate-ai` PATH shim |
 
 Harness side: `--model`, `--host`, `--num-ctx`, `--max-iters`, `--mission @file.txt`,
-`--self-test`. In the REPL: 26 slash commands — `/help` lists them all by category
+`--self-test`. In the REPL: 27 slash commands — `/help` lists them all by category
 (`/undo` `/update` `/doctor` `/memory` `/verify` `/config` `/export` `/usage` …).
 
 ## 🩺 Troubleshooting
@@ -293,7 +326,7 @@ ultimate-llm/
 ├── Ultimate-AI.cmd            # the one file you run
 ├── Start-UltimateAI.ps1       # bootstrap orchestrator (fast path + -Full + auto model check)
 ├── lib/                       # hardware scan · model discovery · prereqs
-├── harness/harness.py         # the agent REPL (26 tools, 26 commands, scroll-stable progress)
+├── harness/harness.py         # the agent REPL (26 tools, 27 commands, scroll-stable progress)
 ├── tools/                     # proof drivers + analyzers (progress, slash-live, audit)
 ├── docs/IMPROVEMENTS-2026-10.md  # scout findings triage (applied/rejected, with sources)
 ├── missions/                  # 12-mission battery + verifier + run-battery.ps1

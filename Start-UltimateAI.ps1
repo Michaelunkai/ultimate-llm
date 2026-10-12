@@ -275,6 +275,12 @@ if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offli
             Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $checkCmd) | Out-Null
         }
         catch { }
+        # CPU courtesy: inference is GPU-bound; keep ollama's CPU threads below
+        # normal so terminals/games always win CPU fights (best effort, silent).
+        try {
+            Get-Process -Name ollama,ollama_llama_server -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = 'BelowNormal' } catch { } }
+        }
+        catch { }
         Write-Host ('[READY] fast launch: ' + $tag + ' - bootstrap cached (run with -Full to redo discovery/setup).') -ForegroundColor Cyan
     }
 }
