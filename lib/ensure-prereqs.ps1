@@ -189,6 +189,18 @@ function Ensure-Prerequisites {
     # 2) ollama daemon
     $ollamaPath = Get-PrereqOllamaPath
     if (-not [string]::IsNullOrEmpty($ollamaPath) -and -not (Test-PrereqOllamaDaemon -OllamaExe $ollamaPath)) {
+        # Max-context opt-in (deliberate, documented in the llm skill + final
+        # report): flash attention + q8_0 KV cache halve KV memory, which is
+        # what makes the 65536 real-prompt window fit in 16GB VRAM. Persisted
+        # user-level so daemon respawns (incl. the Ollama app after reboot)
+        # inherit it too.
+        try {
+            $env:OLLAMA_FLASH_ATTENTION = '1'
+            $env:OLLAMA_KV_CACHE_TYPE = 'q8_0'
+            [Environment]::SetEnvironmentVariable('OLLAMA_FLASH_ATTENTION', '1', 'User')
+            [Environment]::SetEnvironmentVariable('OLLAMA_KV_CACHE_TYPE', 'q8_0', 'User')
+        }
+        catch { }
         try {
             $null = Start-Process -FilePath $ollamaPath -ArgumentList 'serve' -WindowStyle Hidden
         }

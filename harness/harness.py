@@ -1055,6 +1055,29 @@ def _run_captured(cmd, timeout_s: float, shell: bool = False, cwd: str = None) -
     return f"[cwd: {workdir}]\n" + (out or "(no output)") + f"\n[exit code: {proc.returncode}]"
 
 
+_PS_EXE_CACHE = None
+
+
+def _resolve_powershell():
+    """Absolute path to a PowerShell executable, or None. Bare 'powershell' is NOT
+    on this machine's spawned-process PATH (WinError 2 proven live), so every
+    invocation must use a resolved absolute path."""
+    global _PS_EXE_CACHE
+    if _PS_EXE_CACHE is not None:
+        return _PS_EXE_CACHE if _PS_EXE_CACHE != "" else None
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    candidates = [
+        os.path.join(root, r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        os.path.join(root, r"SysWOW64\WindowsPowerShell\v1.0\powershell.exe"),
+    ]
+    exe = next((c for c in candidates if os.path.isfile(c)), None)
+    if not exe:
+        exe = shutil.which("powershell") or shutil.which("pwsh")
+    _PS_EXE_CACHE = exe or ""
+    return _PS_EXE_CACHE or None
+
+
 def register_tool(name: str, description: str, parameters: dict):
     """Decorator: register a tool handler with its name, description and JSON schema."""
 
@@ -1087,8 +1110,14 @@ def tool_run_powershell(args: dict) -> str:
         command = str(args.get("command", ""))
         if not command.strip():
             return "ERROR: command required"
+        ps_exe = _resolve_powershell()
+        if not ps_exe:
+            return (
+                "ERROR: no PowerShell executable found on this machine - "
+                "use run_cmd or run_python instead."
+            )
         return _run_captured(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            [ps_exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
             _as_timeout(args.get("timeout_s")),
             cwd=_resolve_cwd(args),
         )
@@ -1115,7 +1144,10 @@ def tool_run_cmd(args: dict) -> str:
         command = str(args.get("command", ""))
         if not command.strip():
             return "ERROR: command required"
-        return _run_captured(["cmd", "/c", command], _as_timeout(args.get("timeout_s")), cwd=_resolve_cwd(args))
+        # shell=True hands the RAW string to cmd /c verbatim. The previous
+        # list form (["cmd", "/c", command]) mangled embedded quotes through
+        # list2cmdline - quoted executables were echoed instead of run.
+        return _run_captured(command, _as_timeout(args.get("timeout_s")), shell=True, cwd=_resolve_cwd(args))
     except Exception as exc:
         return f"ERROR: {exc}"
 
@@ -1740,8 +1772,8 @@ def tool_web_search(args: dict) -> str:
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Research topic or question"},
-            "max_sources": {"type": "integer", "description": "Top sources to open and digest (default 5, max 8)"},
-            "chars_per_source": {"type": "integer", "description": "Readable characters per source (default 2800)"},
+            "max_sources": {"type": "integer", "description": "Top sources to open and digest (default 6, max 10)"},
+            "chars_per_source": {"type": "integer", "description": "Readable characters per source (default 3200)"},
         },
         "required": ["query"],
     },
@@ -1752,13 +1784,13 @@ def tool_web_research(args: dict) -> str:
         if not query:
             return "ERROR: query required"
         try:
-            max_sources = max(1, min(8, int(args.get("max_sources", 5) or 5)))
+            max_sources = max(1, min(10, int(args.get("max_sources", 6) or 6)))
         except (TypeError, ValueError):
-            max_sources = 5
+            max_sources = 6
         try:
-            chars_per_source = max(800, min(8000, int(args.get("chars_per_source", 2800) or 2800)))
+            chars_per_source = max(800, min(8000, int(args.get("chars_per_source", 3200) or 3200)))
         except (TypeError, ValueError):
-            chars_per_source = 2800
+            chars_per_source = 3200
         from concurrent.futures import ThreadPoolExecutor
 
         merged, used, errors = _search_merge(query, max(max_sources + 3, 8))
@@ -2570,11 +2602,16 @@ def build_system_prompt(override_path=None) -> str:
         "    content; read another section with fetch_url + start_char (long pages come with a note telling "
         "you the exact next start_char). If a tool returns the same error\n"
         "    twice, change the arguments or approach immediately - the harness will also inject guidance.\n"
-        "11. ONLINE RESEARCH: for anything you need from the internet use web_research (ONE call - "
-        "multi-engine search plus parallel headless digests of the top sources with their URLs) or "
+        "11. ONLINE RESEARCH: for anything you need from the internet use web_research (ONE call per "
+        "query - multi-engine search plus parallel headless digests of the top sources with their URLs) or "
         "web_search + fetch_url. This reads the web directly with no browser window. Only use "
         "open_in_browser when a task explicitly requires interactive VISUAL rendering, since it opens a "
-        "real window on the user's screen.\n"
+        "real window on the user's screen. DEPTH IS MANDATORY WHEN REQUESTED: for 'scan/research/look "
+        "online for N minutes', 'deeply', 'thoroughly' - run MULTIPLE web_research calls with DIFFERENT "
+        "queries (product/angle/alternatives/comparison/changelog/benchmarks/known issues), open the "
+        "best pages with fetch_url and read further sections via start_char, and cross-check key claims "
+        "on a second source before relying on them. Never stop after a single search when depth was "
+        "requested.\n"
         "12. LOSSLESS MEMORY: the append-only session archive keeps EVERY turn of EVERY session verbatim "
         "and is never compacted away. When the current context or its summary lacks an earlier detail - "
         "a decision, file path, name, number, or anything from before a context compaction - call "
@@ -2584,6 +2621,12 @@ def build_system_prompt(override_path=None) -> str:
         "\"top\", \"which\"), or any online resource, use web_research / web_search + fetch_url FIRST and "
         "answer ONLY from tool results. Cite only URLs that appeared in your tool results. If a lookup "
         "fails, say exactly what you could not verify.\n"
+        "14. TIME CONTRACTS: when the user states a duration or depth for your work (e.g. 'scan for 10 "
+        "minutes', 'spend an hour', 'research until you have everything'), that is a HARD CONTRACT: keep "
+        "performing NEW, progressively deeper tool work until the harness clock confirms the requested "
+        "time has elapsed. The harness REFUSES premature task_done while a time contract is unfulfilled - "
+        "never argue and never finish early; do more research, deeper reading, cross-checks, and build "
+        "the final deliverable in sections instead. Every minute must add real material, never idling.\n"
         "\n"
         "VERIFICATION PROTOCOL — before calling task_done you MUST re-verify every artifact: open/read files\n"
         "you wrote, re-run scripts you created, check outputs match EVERY stated requirement (counts, sums,\n"
@@ -3374,12 +3417,41 @@ def estimate_tokens(messages) -> int:
     return int(sum(len(str(m.get("content", ""))) for m in messages) / 3.5)
 
 
+def _compaction_threshold() -> int:
+    """Compact before the request can overflow the REAL window. Derived from the
+    active num_ctx (70% of it, clamped to 80%) instead of a fixed 22000, so a
+    proven-larger context window proportionally raises the trigger; a bigger
+    explicit config value is honored but never past 80% of the window."""
+    ctx = int(STATE.get("num_ctx") or 0)
+    if ctx <= 0:
+        return int(CONFIG.get("compaction_threshold", 22000) or 22000)
+    derived = int(ctx * 0.70)
+    ceiling = max(8000, int(ctx * 0.80))
+    cfg = int(CONFIG.get("compaction_threshold", 22000) or 22000)
+    return max(8000, min(max(cfg, derived), ceiling))
+
+
+def _ctx_proof_num_ctx(model: str):
+    """Largest REAL-prompt-proven context window for this model, or None.
+    Written by tools/ctx_proof.py (ADOPT verdict) at the project root."""
+    try:
+        raw = json.loads(
+            (Path(__file__).resolve().parents[1] / ".ctx-proof.json").read_text(encoding="utf-8")
+        )
+        if str(raw.get("model", "")).strip() == str(model).strip():
+            n = int(raw.get("num_ctx") or 0)
+            return n if n > 0 else None
+    except Exception:
+        pass
+    return None
+
+
 def compact_history(console: "Console", force: bool = False) -> bool:
     """Summarize older turns into a rolling context summary so the session can
     run forever inside a fixed context window. Returns True if compaction ran."""
     msgs = STATE["messages"]
     est = STATE.get("ctx_tokens") or estimate_tokens(msgs)
-    if not force and est < CONFIG.get("compaction_threshold", 22000):
+    if not force and est < _compaction_threshold():
         return False
     # Storm guard: a flood of tiny turns (e.g. 20 one-line writes) can cross the
     # threshold every other step; summarizing that often starves the actual work.
@@ -3388,7 +3460,7 @@ def compact_history(console: "Console", force: bool = False) -> bool:
     if (
         not force
         and (now_mono - STATE.get("last_compaction_mono", -1e9)) < 45
-        and est < CONFIG.get("compaction_threshold", 22000) * 1.35
+        and est < _compaction_threshold() * 1.35
     ):
         return False
     if len(msgs) < 12:
@@ -3488,6 +3560,21 @@ def run_agent_turn(user_input: str, args) -> None:
     STATE["required_tools"] = parse_required_tools(user_input)
     STATE["evidence_rejects"] = 0
     STATE["url_lint_used"] = False
+    # TIME CONTRACT: an interactive goal that states a duration ("scan online for
+    # 10 minutes") is a hard minimum-work commitment - task_done is refused until
+    # the clock confirms it. Missions are excluded (certified battery semantics).
+    STATE["turn_start_mono"] = time.monotonic()
+    if STATE.get("mission_mode"):
+        STATE["duration_contract_s"] = None
+    else:
+        contract = parse_duration_contract(user_input)
+        STATE["duration_contract_s"] = contract
+        STATE["duration_rejects"] = 0
+        if contract:
+            engine_say(
+                console,
+                f"[yellow](time contract: at least {contract // 60}m {contract % 60}s of real work before completion is accepted)[/]",
+            )
     # /undo snapshots (conversation-level rollback; the archive keeps everything)
     snaps = STATE.setdefault("snaps", [])
     snaps.append([dict(m) for m in STATE["messages"]])
@@ -3530,9 +3617,7 @@ def run_agent_turn(user_input: str, args) -> None:
     tool_errors = 0
     try:
         for _iteration in range(1, max(1, args.max_iters) + 1):
-            if (STATE.get("ctx_tokens") or estimate_tokens(STATE["messages"])) > CONFIG.get(
-                "compaction_threshold", 22000
-            ):
+            if (STATE.get("ctx_tokens") or estimate_tokens(STATE["messages"])) > _compaction_threshold():
                 compact_history(console)
             engine_emit(
                 lambda: console.print(
@@ -3549,6 +3634,28 @@ def run_agent_turn(user_input: str, args) -> None:
                     STATE["last_outcome"] = "interrupted"
                     return
                 except ChatError as exc:
+                    low = str(exc).lower()
+                    # ENDURANCE: a context overflow is never fatal - compact hard
+                    # and retry; a VRAM/memory failure degrades num_ctx to the
+                    # last proven floor and retries. The session keeps working.
+                    if any(k in low for k in (
+                        "context window", "context length", "too many tokens",
+                        "num_ctx", "exceeds", "beyond the context", "maximum context",
+                        "prompt is too long", "input length",
+                    )):
+                        engine_say(console, "[yellow](context overflow - compacting hard and retrying)[/]")
+                        compact_history(console, force=True)
+                    elif any(k in low for k in (
+                        "out of memory", "oom", "cuda error", "kv cache", "exhausted",
+                        "failed to allocate", "vector::reserve", "not enough memory",
+                    )):
+                        cur = int(STATE.get("num_ctx") or 0)
+                        if cur > 32768:
+                            STATE["num_ctx"] = 32768
+                            engine_say(console, "[yellow](VRAM pressure - context window dropped to the proven-safe 32768)[/]")
+                        elif cur > 8192:
+                            STATE["num_ctx"] = max(8192, cur // 2)
+                            engine_say(console, f"[yellow](VRAM pressure - context window halved to {STATE['num_ctx']})[/]")
                     chat_retries -= 1
                     if chat_retries > 0:
                         engine_say(console, f"[yellow](chat error, retrying: {str(exc)[:140]}...)[/]")
@@ -3679,6 +3786,12 @@ def run_agent_turn(user_input: str, args) -> None:
                             # Injected note must come AFTER the last tool result of
                             # this assistant message - skip remaining sibling calls.
                             break
+                        dc = duration_contract_remaining()
+                        if dc and dc[1] > 15:
+                            # TIME CONTRACT: refuse while the requested duration is
+                            # unfulfilled (sibling calls skipped, same as gate_hit).
+                            reject_premature_task_done(console)
+                            break
                         if not STATE.get("done_confirmed"):
                             STATE["done_confirmed"] = True
                             if STATE.get("mission_mode"):
@@ -3781,6 +3894,10 @@ def run_agent_turn(user_input: str, args) -> None:
                                 ),
                             }
                         )
+                        continue
+                    dc = duration_contract_remaining()
+                    if dc and dc[1] > 15:
+                        reject_premature_task_done(console)
                         continue
                     if not STATE.get("done_confirmed"):
                         STATE["done_confirmed"] = True
@@ -3940,18 +4057,27 @@ def run_agent_turn(user_input: str, args) -> None:
                 )
                 continue
             nudges = STATE.get("done_nudges", 0)
-            max_nudges = 3 if STATE.get("mission_mode") else 1
+            contract_active = bool(STATE.get("duration_contract_s"))
+            max_nudges = 3 if STATE.get("mission_mode") else (200 if contract_active else 1)
             # A clean interactive Q&A (real answer, no tools, no open question)
             # is COMPLETE - task_done is for missions, not for every chat turn.
-            # Nudging those doubled every answer's latency for nothing.
+            # Nudging those doubled every answer's latency for nothing. A time
+            # contract suspends this shortcut: the minutes are still owed.
             clean_qa = (
                 not STATE.get("mission_mode")
+                and not contract_active
                 and tool_count == 0
                 and len(stripped) >= 40
                 and not content.rstrip().endswith("?")
             )
             if nudges < max_nudges and not clean_qa:
                 STATE["done_nudges"] = nudges + 1
+                if contract_active:
+                    dc = duration_contract_remaining()
+                    if dc and dc[1] > 15:
+                        reject_premature_task_done(console)
+                        continue
+                    STATE["duration_contract_s"] = None  # fulfilled - normal flow resumes
                 engine_say(console, "[yellow](no task_done call detected - nudging the agent to confirm completion)[/]")
                 STATE["messages"].append(
                     {
@@ -3971,10 +4097,16 @@ def run_agent_turn(user_input: str, args) -> None:
             STATE["engine"] = None
             turn_engine.stop()
     STATE["last_outcome"] = "max_iters"
+    dc = duration_contract_remaining()
+    extra = (
+        f" A time contract of {dc[2] // 60}m is still unfulfilled - rerun or raise --max-iters."
+        if dc
+        else ""
+    )
     engine_emit(
         lambda: console.print(
             Panel(
-                f"[bold red]MAX ITERATIONS[/] - the agent loop stopped after {args.max_iters} iterations without task_done.",
+                f"[bold red]MAX ITERATIONS[/] - the agent loop stopped after {args.max_iters} iterations without task_done.{extra}",
                 border_style="red",
             )
         )
@@ -4732,6 +4864,113 @@ def parse_required_tools(mission_text: str) -> list:
     return out
 
 
+_DURATION_NUM_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "ninety": 90,
+}
+_DURATION_UNIT_S = {
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+}
+_DURATION_VERBS = (
+    r"scan\w*|research\w*|search\w*|look\w*|brows\w*|read\w*|study\w*|dig\w*|"
+    r"explor\w*|investigat\w*|monitor\w*|work\w*|spend\w*|test\w*|run\w*|keep\w*|check\w*"
+)
+_DURATION_NUM = r"(\d+(?:\.\d+)?|" + "|".join(_DURATION_NUM_WORDS) + r")"
+_DURATION_UNIT = r"(hours?|hrs?|h|minutes?|mins?|min|seconds?|secs?)\b"
+
+
+def _duration_num_seconds(num_text: str, unit_text: str):
+    try:
+        n = float(num_text)
+    except ValueError:
+        n = float(_DURATION_NUM_WORDS.get(num_text.lower().strip(), 0))
+    u = _DURATION_UNIT_S.get(unit_text.lower().strip(), 0)
+    return int(n * u) if n > 0 and u > 0 else None
+
+
+def parse_duration_contract(text: str):
+    """Seconds the user explicitly committed the agent to work for, or None.
+
+    Recognizes ONLY directive phrasings so plans/estimates in the user's own
+    text never create a contract: 'for at least ten minutes', 'scan online for
+    10 minutes', 'spend 2 hours', '10 minutes of scanning', 'half an hour of
+    research'. Capped at 24h. Pure."""
+    s = str(text or "")
+    if not s.strip():
+        return None
+    low = s.lower()
+    cap = 24 * 3600
+    m = re.search(r"\bhalf\s+an\s+hour\b", low)
+    if m:
+        return 1800
+    for pattern in (
+        rf"\b(?:for|during)\s+(?:at\s+least|a\s+minimum\s+of|minimum\s+of|no\s+less\s+than|at\s+minimum|about|around|approximately|roughly)?\s*{_DURATION_NUM}\s*{_DURATION_UNIT}",
+        rf"\b(?:{_DURATION_VERBS})[^.!?\n]{{0,60}}?\bfor\s+{_DURATION_NUM}\s*{_DURATION_UNIT}",
+        rf"\bat\s+least\s+{_DURATION_NUM}\s*{_DURATION_UNIT}",
+        rf"\bspend\w*\s+(?:about\s+|around\s+|roughly\s+|approximately\s+)?{_DURATION_NUM}\s*{_DURATION_UNIT}",
+        rf"\b{_DURATION_NUM}\s*{_DURATION_UNIT}\s+of\s+(?:online\s+|deep\s+|web\s+|thorough\s+)?(?:scanning|researching|research|searching|browsing|reading|studying|digging|testing|monitoring|checking|work)\b",
+    ):
+        mm = re.search(pattern, low)
+        if mm:
+            secs = _duration_num_seconds(mm.group(1), mm.group(2))
+            if secs:
+                return min(secs, cap)
+    return None
+
+
+_DURATION_ANGLE_GUIDANCE = [
+    "Continue DEEPER: run new web_research queries from fresh angles (alternatives, comparisons, "
+    "changelogs, benchmarks, known issues), then fetch_url the most promising pages and read "
+    "deeper sections via start_char.",
+    "Cross-check: verify your strongest claims against a second independent source; note where "
+    "sources agree and contradict.",
+    "Synthesize: draft the structured findings/plan NOW (real headings and content), then keep "
+    "researching to fill every gap you notice in your own draft.",
+    "Go broad: cover adjacent subtopics the user will plausibly need next; prefer official docs "
+    "and sources updated this month.",
+]
+
+
+def duration_contract_remaining():
+    """(elapsed_s, remaining_s, contract_s) for the active time contract, or None."""
+    contract = int(STATE.get("duration_contract_s") or 0)
+    if contract <= 0:
+        return None
+    elapsed = time.monotonic() - float(STATE.get("turn_start_mono") or time.monotonic())
+    return elapsed, max(0.0, contract - elapsed), contract
+
+
+def reject_premature_task_done(console: "Console") -> None:
+    """Refuse an early task_done while a TIME CONTRACT is unfulfilled and tell the
+    model exactly what to do with the remaining time (rotating guidance)."""
+    elapsed, remaining, contract = duration_contract_remaining()
+    rej = int(STATE.get("duration_rejects", 0)) + 1
+    STATE["duration_rejects"] = rej
+    engine_say(
+        console,
+        f"[yellow](time contract: {int(remaining // 60)}m {int(remaining % 60):02d}s of the requested "
+        f"{contract // 60}m {contract % 60:02d}s still unfulfilled - task_done refused)[/]",
+    )
+    angle = _DURATION_ANGLE_GUIDANCE[(rej - 1) % len(_DURATION_ANGLE_GUIDANCE)]
+    STATE["messages"].append(
+        {
+            "role": "user",
+            "content": (
+                f"(time contract: the user explicitly committed you to at least {contract // 60} minutes "
+                f"of this work. Only {int(elapsed // 60)}m {int(elapsed % 60):02d}s has elapsed and "
+                f"{int(remaining // 60)}m {int(remaining % 60):02d}s remain. Stopping now violates the "
+                f"user's instruction. {angle} task_done will keep being refused until the time contract "
+                f"is fulfilled. Never idle or repeat already-read content - every step must add new material.)"
+            ),
+        }
+    )
+
+
 def evidence_missing(required: list, tool_log: list, compaction_seq, trim_base: int = 0) -> list:
     """Required tools with no recorded call AFTER the first compaction (or at
     all when no compaction happened). compaction_seq is an ABSOLUTE sequence
@@ -4808,7 +5047,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, help="Ollama model tag, e.g. qwen3:8b")
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama base URL")
     parser.add_argument(
-        "--max-iters", dest="max_iters", type=int, default=120, help="Max agent iterations per goal (default 120)"
+        "--max-iters", dest="max_iters", type=int, default=600, help="Max agent iterations per goal (default 600)"
     )
     parser.add_argument("--num-ctx", dest="num_ctx", type=int, default=None, help="Ollama num_ctx context window override")
     parser.add_argument(
@@ -4947,6 +5186,41 @@ def run_self_test() -> int:
         assert missing_checklist_items("all requirements verified against disk") == [1, 2, 3]
         STATE["mission_text"] = None
 
+        # 29) TIME CONTRACT parser: directives match, plans/estimates never do
+        assert parse_duration_contract("For at least ten minutes scan online for everything about X") == 600
+        assert parse_duration_contract("scan online for 10 minutes") == 600
+        assert parse_duration_contract("research this topic for 5 minutes") == 300
+        assert parse_duration_contract("spend 2 hours on it") == 7200
+        assert parse_duration_contract("do 30 seconds of checking") == 30
+        assert parse_duration_contract("give me 10 minutes of scanning online") == 600
+        assert parse_duration_contract("half an hour of research") == 1800
+        assert parse_duration_contract("minimum of 15 minutes of reading") == 900
+        assert parse_duration_contract("how many minutes will it take") is None
+        assert parse_duration_contract("the plan takes 20-25 minutes to implement") is None
+        assert parse_duration_contract("in 10 minutes you should be done") is None
+        assert parse_duration_contract("") is None
+        assert parse_duration_contract("scan deeply and look everywhere") is None
+
+        # 30) PowerShell resolution: absolute path exists (WinError 2 regression)
+        ps_exe = _resolve_powershell()
+        assert ps_exe and os.path.isfile(ps_exe), f"powershell resolution failed: {ps_exe!r}"
+        # 31) run_cmd/run_powershell execute for real (raw string / absolute exe)
+        rc = TOOLS["run_cmd"]["fn"]({"command": "echo selftest-cmd-ok"})
+        assert "selftest-cmd-ok" in rc, f"run_cmd smoke failed: {rc[:120]}"
+        rp = TOOLS["run_powershell"]["fn"]({"command": "Write-Output selftest-ps-ok"})
+        assert "selftest-ps-ok" in rp, f"run_powershell smoke failed: {rp[:120]}"
+
+        # 32) compaction threshold derives from num_ctx (endurance at 65536)
+        old_ctx = STATE.get("num_ctx")
+        STATE["num_ctx"] = 32768
+        thr32 = _compaction_threshold()
+        STATE["num_ctx"] = 65536
+        thr64 = _compaction_threshold()
+        STATE["num_ctx"] = old_ctx
+        assert 8000 <= thr32 <= int(32768 * 0.80), f"32k threshold out of range: {thr32}"
+        assert thr64 > thr32, f"64k threshold must exceed 32k: {thr64} vs {thr32}"
+        assert thr64 <= int(65536 * 0.80), f"64k threshold exceeds safety ceiling: {thr64}"
+
         print("SELF-TEST PASS")
         return 0
     except AssertionError as exc:
@@ -5032,6 +5306,18 @@ def main(argv=None) -> int:
         system_prompt = build_system_prompt()
 
     STATE.update(model=args.model, host=args.host, num_ctx=args.num_ctx, done=False)
+    # Maximize the context window permanently: when a REAL-prompt proof (written
+    # by tools/ctx_proof.py) shows a larger window than the launcher's baseline,
+    # adopt it. Overflow/OOM auto-degrade in the agent loop protects the session
+    # if the daemon ever loses the KV-cache env that makes the big window safe.
+    _proof_ctx = _ctx_proof_num_ctx(args.model or "")
+    if _proof_ctx and int(STATE.get("num_ctx") or 0) < _proof_ctx:
+        STATE["num_ctx"] = _proof_ctx
+    _cur_ctx = int(STATE.get("num_ctx") or 0)
+    if _cur_ctx >= 32768:
+        STATE["ctx_floor"] = 32768
+    elif _cur_ctx > 0:
+        STATE["ctx_floor"] = _cur_ctx
     STATE["messages"] = [{"role": "system", "content": system_prompt}]
 
     session_file = SESSIONS_DIR / f"{datetime.now():%Y%m%d-%H%M%S}.json"
