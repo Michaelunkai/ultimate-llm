@@ -259,7 +259,7 @@ if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offli
         # very first message does not wait for the weights to load.
         try {
             $warmCmd = "Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:11434/api/generate' -ContentType 'application/json' -TimeoutSec 300 -Body (@{ model='" + $tag + "'; prompt=''; keep_alive='24h'; stream=`$false } | ConvertTo-Json) | Out-Null"
-            Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $warmCmd) | Out-Null
+            Start-Process -WindowStyle Hidden -FilePath (Join-Path $PSHome 'powershell.exe') -ArgumentList @('-NoProfile', '-Command', $warmCmd) | Out-Null
         }
         catch { }
         # Background better-model check (detached, TTL-gated to one run per 12h;
@@ -272,7 +272,7 @@ if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offli
             $checkFileQ = $checkFile.Replace("'", "''")
             $libDirQ = $libDir.Replace("'", "''")
             $checkCmd = "`$out='$checkFileQ'; if (-not (Test-Path -LiteralPath `$out) -or ((Get-Date) - (Get-Item -LiteralPath `$out).LastWriteTime).TotalHours -ge 12) { . (Join-Path '$libDirQ' 'hardware-scan.ps1'); . (Join-Path '$libDirQ' 'discover-model.ps1'); Write-ModelCheck -StateFile '$stateFileQ' -OutFile `$out }"
-            Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $checkCmd) | Out-Null
+            Start-Process -WindowStyle Hidden -FilePath (Join-Path $PSHome 'powershell.exe') -ArgumentList @('-NoProfile', '-Command', $checkCmd) | Out-Null
         }
         catch { }
         # CPU courtesy: inference is GPU-bound; keep ollama's CPU threads below
