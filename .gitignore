@@ -7,3 +7,8 @@ backup_log.txt
 data/
 report.md
 *.log
+
+# v2 round sidecars
+.model-check.json
+progress-audit*.jsonl
+exports/

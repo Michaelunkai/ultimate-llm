@@ -3,3 +3,6 @@ logs/
 .venv/
 __pycache__/
 .bootstrap-state.json
+compliance/LIVE/
+compliance/MEM/
+compliance/T[0-9]/

@@ -3,7 +3,8 @@
 # ⚡ Ultimate AI
 
 **One double-click turns a Windows PC into a full-permission local AI agent —
-the best model of the day, 24 system tools, real-time progress, and a
+the best model of the day (re-checked automatically every launch), 26 system
+tools, scroll-stable real-time progress, lossless session memory, and a
 sub-second interactive launch.**
 
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
@@ -30,9 +31,11 @@ sub-second interactive launch.**
    score candidates for your exact VRAM/RAM, and pick one — with a curated offline
    fallback catalog when the network is down.
 3. **Install everything** that is missing (Ollama, Python, venv, packages) silently.
-4. **Pull the model** and open a **full-permission agentic REPL** with 24 built-in tools.
+4. **Pull the model** and open a **full-permission agentic REPL** with 26 built-in tools.
 5. On every later launch: **interactive mode in under one second**, model warming in the
-   background on full GPU context.
+   background on full GPU context — plus a **silent background check** (every ≤12 h) that
+   tells you when a clearly better model exists for your hardware and upgrades you with
+   one command (`/update`).
 
 The agent then works on whatever you ask — creating projects, running code, organizing
 files, git workflows, web research, desktop automation — streaming every step to your
@@ -75,7 +78,7 @@ flowchart LR
     D --> E[Online model discovery<br/>models.dev + ollama.com<br/>offline fallback catalog]
     E --> F[Score and fit<br/>tool-call · coding · recency · VRAM fit]
     F --> H[ollama pull]
-    G --> I[Interactive agent REPL<br/>24 tools · streaming · self-verifying]
+    G --> I[Interactive agent REPL<br/>26 tools · scroll-stable progress · self-verifying]
     H --> I
 ```
 
@@ -92,7 +95,7 @@ flowchart LR
   DeepSeek, Devstral, Mistral, Llama, Phi, Gemma families). You can always override with
   `-Model <tag>`.
 
-### The harness — 24 tools, full permission
+### The harness — 26 tools, full permission
 
 | Group | Tools |
 |---|---|
@@ -101,12 +104,18 @@ flowchart LR
 | Web (headless, no browser) | `web_research` `web_search` `fetch_url` `open_in_browser` (visual last resort) |
 | Desktop | `screenshot` `clipboard_get` `clipboard_set` `notify_user` |
 | Projects | `git_run` `scaffold_project` |
-| Memory & control | `memory_read` `memory_write` `task_done` |
+| Memory & control | `memory_read` `memory_write` `memory_search` `task_done` |
 
 The agent auto-approves everything (no confirmation prompts), may touch any drive, and
 loops until it calls `task_done` — which it may only do after **re-verifying its own
 work** (re-reading files, re-running scripts, checking every number). Native Ollama tool
 calling is used, with a JSON fallback protocol for models that need it.
+
+**Never argues, never stops — structurally.** Compliance is not just prompted, it is
+enforced by the loop: replies that argue/refuse are detected and re-forced to act (or to
+state the missing input in one line), vague tasks get a one-line-assumption-then-act
+injection, and the final `task_done` passes a checklist gate that rejects summaries which
+did not explicitly verify every numbered requirement.
 
 ### Best-in-class online research (headless)
 
@@ -119,17 +128,62 @@ calling is used, with a JSON fallback protocol for models that need it.
   reading instructions).
 - `open_in_browser` exists only as a visual last resort for pages that truly need interactive rendering.
 
-### Real-time progress, in English
+### Real-time progress — scroll-stable, proven ≤5s
+
+Progress never fights your scroll again. While the model thinks or a tool runs, the
+harness updates **three channels** every ~2.5s (piped runs: plain 3s lines):
+
+- the **window/tab title** — visible even while scrolled up, cannot scroll anything;
+- **one in-place status line** at the bottom (`\r`+erase-line rewrite, never a newline —
+  a line that never grows can never yank a scrolled-up viewport, in classic console or
+  Windows Terminal);
+- a **JSONL audit trail** (`~/.ultimate-ai/progress-audit.jsonl`) — machine-checkable
+  proof of the "fresh progress at least every 5 seconds" guarantee
+  (`tools/analyze_progress.py` verifies max-gap < 5s; measured real-console runs: 2.5s).
+
+If you scroll up to re-read earlier output **while the agent keeps working**, the
+viewport stays exactly where you left it (verified programmatically: viewport rect
+frozen for 30s while 23 fresh progress ticks landed), and real output lines are
+deferred until you scroll back down. The taskbar even shows a progress ring
+(OSC 9;4) while work is in flight.
 
 ```text
-── STEP 4 • 19:56:48.112 • elapsed 00:09 • thinking + streaming…
-┌─────────── TOOL CALL #7 • run_powershell • 19:56:49.301 ───────────┐
-┌─────────── run_powershell RESULT • 0.8s • OK ──────────────────────┐
-TASK CONFIRMED COMPLETE • started 19:56:37 • finished 19:57:08 • total 00:31
-   steps 9 • tool calls 9 (0 errors)
+── step 4 · 19:56:48 · elapsed 00:09
+⚡ model working · 1,204 answer chars · 7s · #4        ← rewritten in place
+⚙ TOOL CALL #7 · run_powershell(Get-ChildItem)
+✓ run_powershell · 0.8s · (output)
+TASK CONFIRMED COMPLETE • total 00:31 • steps 9 • tool calls 9 (0 errors)
 ```
 
-Every step, every tool call, every result — timestamped and readable while it happens.
+### Lossless session memory — nothing is ever forgotten
+
+The agent's working context auto-compacts on long sessions, but **every turn of every
+session is also appended verbatim to a per-session JSONL archive that is never
+compacted away**. The `memory_search` tool (and `/memory <query>`) retrieves any earlier
+turn — across all past sessions — so details from before a compaction are always
+recoverable. Compaction summaries say so explicitly, and the system prompt instructs
+the agent to search instead of guessing or claiming something was forgotten.
+
+### Always the best model, automatically
+
+Every fast launch spawns a silent, detached check (TTL 12h) that re-runs online
+discovery against your exact hardware. If a model that is *clearly better* (score
+delta ≥ +2, still fully in VRAM) appears, the banner tells you and **`/update` performs
+the whole upgrade** — background pull with live progress, atomic bootstrap-state
+rewrite, instant switch. `/doctor` reports the check status any time.
+
+### 26 slash commands
+
+| Session | Memory | Model & System | Info |
+|---|---|---|---|
+| `/new` `/sessions` `/save` `/reset` `/undo` `/retry` `/swipe` `/export` `/exit` | `/memory` `/note` `/history` `/compact` | `/model` `/update` `/config` `/system` `/doctor` | `/help` `/tools` `/stats` `/usage` `/research` `/cwd` `/copy` |
+
+Highlights: `/undo` (roll back the last exchange), `/doctor` (10-point health check:
+daemon, model, GPU, disk, deps, config, archive integrity, network, upgrade status,
+registry), `/config` (persistent settings in `~/.ultimate-ai/config.json`: progress
+cadence, compaction threshold, auto-update, theme…), `/verify` (re-verify the last
+deliverable against the original request), `/usage` (live context budget), `/export`
+(session → Markdown), `/swipe` (clear the view, keep the session).
 
 ---
 
@@ -156,6 +210,18 @@ agent receives only the mission text — no help — and must produce real, chec
 
 **Definitive single-sweep result on the reference machine (RTX 5080 16 GB, Ryzen
 9800X3D, 94 GB RAM): 12/12 PASSED.** Logs for every run are in `missions/logs/`.
+
+Beyond the battery, `missions/compliance/` holds structural behavior tests with their
+own checkers: **T1** impossible task (one-line impossibility + reason, no lecture),
+**T2** vague task (one-line assumption, then ≥3 tool calls and a real artifact),
+**T3** pushback bait (exact compliance, zero refusal language), **MEM** lossless
+memory (retrieve a codeword from *before* a real compaction via `memory_search`), and
+**LIVE** — a fresh end-to-end mission (online research + build + determinism +
+independent recomputation) never used in the battery. Run a certified sweep with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File missions\run-battery.ps1 -Label S1
+```
 
 Run the battery yourself:
 
@@ -201,7 +267,8 @@ after hardware changes or when you want the newest model of the day.
 | `-NoAlias` | skip the `ultimate-ai` PATH shim |
 
 Harness side: `--model`, `--host`, `--num-ctx`, `--max-iters`, `--mission @file.txt`,
-`--self-test`. In the REPL: `/tools`, `/model <tag>`, `/reset`, `/save`, `/exit`.
+`--self-test`. In the REPL: 26 slash commands — `/help` lists them all by category
+(`/undo` `/update` `/doctor` `/memory` `/verify` `/config` `/export` `/usage` …).
 
 ## 🩺 Troubleshooting
 
@@ -224,11 +291,13 @@ optionally `ollama rm <model-tag>`.
 ```text
 ultimate-llm/
 ├── Ultimate-AI.cmd            # the one file you run
-├── Start-UltimateAI.ps1       # bootstrap orchestrator (fast path + -Full)
+├── Start-UltimateAI.ps1       # bootstrap orchestrator (fast path + -Full + auto model check)
 ├── lib/                       # hardware scan · model discovery · prereqs
-├── harness/harness.py         # the agent REPL (24 tools, streaming, self-verifying)
-├── missions/                  # 12-mission proving battery + independent verifier
-└── README.md
+├── harness/harness.py         # the agent REPL (26 tools, 26 commands, scroll-stable progress)
+├── tools/                     # proof drivers + analyzers (progress, slash-live, audit)
+├── docs/IMPROVEMENTS-2026-10.md  # scout findings triage (applied/rejected, with sources)
+├── missions/                  # 12-mission battery + verifier + run-battery.ps1
+└── missions/compliance/       # structural behavior tests (T1-T3, MEM, LIVE) + checkers
 ```
 
 ## License

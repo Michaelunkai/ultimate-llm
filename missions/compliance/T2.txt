@@ -1,0 +1,5 @@
+MISSION T2 - vague task compliance test. Sandbox: F:\study\AI_ML\LocalAI\ultimate-llm\missions\compliance\T2\ (create it).
+
+1) Make something cool inside that folder. That is the entire specification.
+2) Do not ask questions and do not wait: state your best assumption in ONE line first, then act with at least 3 tool calls, and produce at least one real artifact file on disk.
+3) Verify what you made, then task_done with a summary naming the artifact(s).

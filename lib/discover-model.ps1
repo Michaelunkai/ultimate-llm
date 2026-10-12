@@ -122,6 +122,14 @@ function New-EmbeddedCatalog {
         @{ tag='gemma3:12b';           display_name='Gemma 3';           family='gemma3';      params_b=12;   quant='Q4_K_M'; size_gb=8.0;  moe=$false; tool_call=$false; coder=$false; family_weight=6.5; recency_rank=3 }
         @{ tag='gemma3:27b';           display_name='Gemma 3';           family='gemma3';      params_b=27;   quant='Q4_K_M'; size_gb=17.0; moe=$false; tool_call=$false; coder=$false; family_weight=7.0; recency_rank=3 }
         @{ tag='gemma3:4b';            display_name='Gemma 3';           family='gemma3';      params_b=4;    quant='Q4_K_M'; size_gb=3.3;  moe=$false; tool_call=$false; coder=$false; family_weight=6.5; recency_rank=3 }
+        # 2026-10 scout refresh (sources: ollama.com/library, qwen.ai -- see
+        # docs/IMPROVEMENTS-2026-10.md). Entries above the vram/vram+ram fit lines are
+        # inert on this 16GB machine by design - they exist for future hardware.
+        @{ tag='qwen3.6:35b';          display_name='Qwen3.6';            family='qwen3.6';     params_b=35;   quant='Q4_K_M'; size_gb=23.0; moe=$true;  tool_call=$true;  coder=$true;  family_weight=9.7; recency_rank=0 }
+        @{ tag='qwen3.8:27b';          display_name='Qwen3.8';            family='qwen3.8';     params_b=27;   quant='Q4_K_M'; size_gb=18.0; moe=$false; tool_call=$true;  coder=$true;  family_weight=9.4; recency_rank=0 }
+        @{ tag='glm-4.7-flash';        display_name='GLM-4.7-Flash';      family='glm';         params_b=30;   quant='q4_K_M'; size_gb=19.0; moe=$true;  tool_call=$true;  coder=$true;  family_weight=9.2; recency_rank=1 }
+        @{ tag='laguna-xs.2';          display_name='Laguna XS.2';        family='laguna';      params_b=33;   quant='q4_K_M'; size_gb=23.0; moe=$true;  tool_call=$true;  coder=$true;  family_weight=9.2; recency_rank=1 }
+        @{ tag='devstral-small-2:24b'; display_name='Devstral Small 2';   family='devstral';    params_b=24;   quant='Q4_K_M'; size_gb=15.0; moe=$false; tool_call=$true;  coder=$true;  family_weight=9.1; recency_rank=2 }
     )
     $out = @()
     foreach ($e in $entries) {
@@ -546,6 +554,100 @@ function Resolve-HardwareProfile {
     } catch {
         return $null
     }
+}
+
+# --------------------------------------------------------------------------- #
+# background better-model check (fast-launch sidecar writer)                  #
+# --------------------------------------------------------------------------- #
+
+function Write-ModelCheck {
+    # Runs inside the detached fast-launch child: re-runs ONLINE discovery with the
+    # hardware cached in .bootstrap-state.json and writes the verdict to the sidecar
+    # (.model-check.json). NEVER writes .bootstrap-state.json (single-writer rule:
+    # only the full path and /update touch the state file).
+    param([string]$StateFile, [string]$OutFile)
+
+    $result = [ordered]@{
+        status        = 'error'
+        current       = $null
+        current_score = 0.0
+        best          = $null
+        score_delta   = 0.0
+        size_gb       = 0.0
+        num_ctx       = 32768
+        reason        = ''
+        checked_at    = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    try {
+        if ([string]::IsNullOrWhiteSpace($StateFile) -or -not (Test-Path -LiteralPath $StateFile)) {
+            $result.reason = 'no-state-file'
+        }
+        else {
+            $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+            $current = [string]$state.model
+            $result.current = $current
+            $result.current_score = [double](Get-EntryField $state 'model_score' 0.0)
+            $hw = $state.hw
+            if ([string]::IsNullOrWhiteSpace($current)) {
+                $result.reason = 'state-has-no-model'
+            }
+            elseif ($null -eq $hw) {
+                $result.reason = 'state-has-no-hw'
+            }
+            elseif ($result.current_score -le 0.0) {
+                # Legacy state written before model_score existed: never claim a
+                # phantom upgrade. One -Full run stores model_score and enables
+                # upgrade detection from then on.
+                $result.status = 'ok'
+                $result.reason = 'state lacks model_score - run once with -Full to enable upgrade checks'
+            }
+            else {
+                # NB: Get-EntryField reads PSObject.Properties -- hashtables are
+                # invisible to it, so the profile must be a pscustomobject.
+                $profile = [pscustomobject]@{
+                    vram_total_gb = [double]$hw.vram_gb
+                    ram_gb        = [double]$hw.ram_gb
+                    gpus          = @([pscustomobject]@{ vram_gb = [double]$hw.vram_gb })
+                }
+                $choice = Select-UltimateModel -HardwareProfile $profile
+                if ($null -eq $choice) {
+                    $result.status = 'error'
+                    $result.reason = 'discovery returned no fit (offline?)'
+                }
+                else {
+                    $result.best = [string]$choice.model
+                    $result.size_gb = [double]$choice.size_gb
+                    $result.num_ctx = [int]$choice.runner.num_ctx
+                    $result.reason = [string]$choice.reason
+                    $delta = [math]::Round(([double]$choice.score - $result.current_score), 2)
+                    $result.score_delta = $delta
+                    if ($choice.model -eq $current) {
+                        $result.status = 'ok'
+                        $result.reason = 'current model is still the best fit (score ' + [double]$choice.score + ')'
+                    }
+                    elseif (($delta -ge 2.0) -and ([string]$choice.fit.mode -eq 'vram')) {
+                        $result.status = 'better'
+                    }
+                    else {
+                        $result.status = 'ok'
+                        $result.reason = 'best alternative not clearly better (delta ' + $delta + ', mode ' + [string]$choice.fit.mode + ')'
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $result.status = 'error'
+        $result.reason = $_.Exception.Message
+    }
+    finally {
+        try {
+            $tmp = $OutFile + '.tmp'
+            (ConvertTo-Json -InputObject $result -Depth 4 -Compress) | Set-Content -LiteralPath $tmp -Encoding ASCII
+            Move-Item -LiteralPath $tmp -Destination $OutFile -Force
+        } catch { }
+    }
+    return $result
 }
 
 # --------------------------------------------------------------------------- #

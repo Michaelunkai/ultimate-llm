@@ -262,6 +262,19 @@ if ((-not $SelfTest) -and (-not $LaunchOnly) -and (-not $Full) -and (-not $Offli
             Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $warmCmd) | Out-Null
         }
         catch { }
+        # Background better-model check (detached, TTL-gated to one run per 12h;
+        # never blocks the sub-second launch). Writes only .model-check.json --
+        # the harness shows a one-line upgrade offer when it says 'better'.
+        try {
+            $checkFile = Join-Path $PSScriptRoot '.model-check.json'
+            $libDir = Join-Path $PSScriptRoot 'lib'
+            $stateFileQ = $stateFile.Replace("'", "''")
+            $checkFileQ = $checkFile.Replace("'", "''")
+            $libDirQ = $libDir.Replace("'", "''")
+            $checkCmd = "`$out='$checkFileQ'; if (-not (Test-Path -LiteralPath `$out) -or ((Get-Date) - (Get-Item -LiteralPath `$out).LastWriteTime).TotalHours -ge 12) { . (Join-Path '$libDirQ' 'hardware-scan.ps1'); . (Join-Path '$libDirQ' 'discover-model.ps1'); Write-ModelCheck -StateFile '$stateFileQ' -OutFile `$out }"
+            Start-Process -WindowStyle Hidden -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $checkCmd) | Out-Null
+        }
+        catch { }
         Write-Host ('[READY] fast launch: ' + $tag + ' - bootstrap cached (run with -Full to redo discovery/setup).') -ForegroundColor Cyan
     }
 }
@@ -515,7 +528,9 @@ else {
                 }
             }
         } catch { $hwOut = $null }
-        $stateOut = @{ model = $tag; num_ctx = $numCtxOut; hw = $hwOut; saved_at = (Get-Date -Format 'o') }
+        $scoreOut = 0.0
+        try { if ($null -ne $choice) { $scoreOut = [double]$choice.score } } catch { $scoreOut = 0.0 }
+        $stateOut = @{ model = $tag; num_ctx = $numCtxOut; hw = $hwOut; saved_at = (Get-Date -Format 'o'); model_score = $scoreOut }
         ($stateOut | ConvertTo-Json -Compress) | Set-Content -LiteralPath $stateFile -Encoding ASCII
         Write-Host ('[STATE] bootstrap cached for fast launches: ' + $stateFile)
     }

@@ -1,4 +1,5 @@
 MISSION 10 - Live web research and synthesis.
 Using your fetch_url tool, fetch these two pages: https://example.com and https://www.iana.org/domains/reserved
 Then write F:\study\AI_ML\LocalAI\ultimate-llm\missions\M10\research_summary.md containing: at least five facts actually stated on those pages, each written out as one or two full sentences (at least 180 words total across the facts), each fact followed by its source URL on the same bullet, and a final "## Sources" section listing both URLs. Do not invent facts that are not on the pages.
-Re-read your file and confirm every fact traces to a fetched page, then call task_done quoting one fact you learned.
+REQUIRED WORD CHECK before task_done: the words "illustrative", "documentation" and "reserved" must ALL appear literally in your file (they come from the two pages: example.com says the domain is for use in illustrative examples in documentation; iana.org says the .example domain is reserved/set aside). Re-read your file; if any of those three words is missing, edit the facts so they appear naturally, then re-read again.
+Then call task_done quoting one fact you learned.

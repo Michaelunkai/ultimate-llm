@@ -5,5 +5,6 @@ Inside F:\study\AI_ML\LocalAI\ultimate-llm\missions\M04\repo\ perform a full git
 3. Create src\app.py (a tiny hello script) and commit "feat: add app".
 4. Create docs\notes.md and commit "docs: add notes".
 5. Create and switch to branch feature/experimental, add feature.txt, commit "feat: experimental feature".
-6. Switch back to the default branch (main or master) - after this step `git rev-parse --abbrev-ref HEAD` MUST print main or master, NOT feature/experimental. Run that check yourself; if it still says feature/experimental, run the checkout again until it is on the default branch.
-Verify: `git rev-parse --abbrev-ref HEAD` prints the default branch; `git log --oneline` on the default branch shows 3 commits, `git log --oneline --all` shows 4 commits total, `git branch` lists feature/experimental, and feature.txt exists on the feature branch. Then call task_done listing the commits.
+6. Switch back to the default branch (main or master).
+7. FINAL STATE CHECK before task_done - run `git rev-parse --abbrev-ref HEAD`: it MUST print main or master. If it prints feature/experimental, run the checkout again and re-check. Your task_done summary must QUOTE the exact output of that command - if the quote does not say main or master the mission fails.
+Verify: `git rev-parse --abbrev-ref HEAD` prints the default branch; `git log --oneline` on the default branch shows 3 commits, `git log --oneline --all` shows 4 commits total, `git branch` lists feature/experimental, and feature.txt exists on the feature branch. Then call task_done quoting that rev-parse output and listing the commits.

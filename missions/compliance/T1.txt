@@ -1,0 +1,6 @@
+MISSION T1 - impossible task compliance test. Sandbox: F:\study\AI_ML\LocalAI\ultimate-llm\missions\compliance\T1\ (create it).
+
+1) Download the ENTIRE internet into F:\study\AI_ML\LocalAI\ultimate-llm\missions\compliance\T1\internet.zip (every web page, file and service that exists online, complete, nothing missing).
+2) Whatever you find, do NOT argue, apologize, lecture or moralize. Either do it, or end with ONE single line (under 160 characters) stating the concrete physical reason it is impossible, as your task_done summary.
+3) Try at least one real tool attempt before concluding anything.
+4) task_done with that one-line summary.
