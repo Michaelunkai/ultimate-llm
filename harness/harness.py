@@ -3131,6 +3131,80 @@ def execute_tool_with_progress(console: "Console", name: str, args):
     return result, time.monotonic() - t0
 
 
+def _ollama_exe():
+    exe = shutil.which("ollama")
+    if exe:
+        return exe
+    cands = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe"),
+        r"C:\Program Files\Ollama\ollama.exe",
+        "/usr/local/bin/ollama",
+        "/usr/bin/ollama",
+        "/opt/ollama/ollama",
+    ]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def _daemon_alive() -> bool:
+    try:
+        r = _httpx().get(STATE["host"].rstrip("/") + "/api/ps", timeout=3.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def revive_daemon(console: "Console") -> bool:
+    """ONE clean daemon revival. The Ollama app's updater can silently take the
+    whole daemon down mid-session (proven 2026-10-13: battery M03 lost to 73
+    connection drops after app+daemon vanished). Detect-down, start ONE serve
+    with the max-context env, wait, reload the model. Returns True when the
+    daemon answers again. Never starts a second instance (alive-check first)."""
+    if _daemon_alive():
+        return False
+    exe = _ollama_exe()
+    if not exe:
+        return False
+    engine_say(console, "[yellow](Ollama daemon is down - reviving it and reloading the model...)[/]")
+    try:
+        env = dict(os.environ)
+        env["OLLAMA_FLASH_ATTENTION"] = "1"
+        env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+        kwargs = {"creationflags": 0x00000008} if os.name == "nt" else {"start_new_session": True}
+        subprocess.Popen(
+            [exe, "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **kwargs,
+        )
+    except Exception as exc:
+        engine_say(console, f"[red](daemon revival could not start serve: {str(exc)[:120]})[/]")
+        return False
+    deadline = time.monotonic() + 90.0
+    while time.monotonic() < deadline:
+        if _daemon_alive():
+            break
+        time.sleep(2.0)
+    if not _daemon_alive():
+        engine_say(console, "[red](daemon did not come back within 90s - connection retries continue)[/]")
+        return False
+    try:
+        _httpx().post(
+            STATE["host"].rstrip("/") + "/api/generate",
+            json={"model": STATE["model"], "prompt": "", "keep_alive": "24h"},
+            timeout=600.0,
+        )
+    except Exception:
+        pass
+    STATE["daemon_revivals"] = STATE.get("daemon_revivals", 0) + 1
+    audit_progress("event", f"daemon revived (revival #{STATE['daemon_revivals']}) - model reloaded")
+    engine_say(console, "[green](Ollama daemon is back - model reloaded, continuing the goal)[/]")
+    return True
+
+
 def apply_stuck_guards(console: "Console", name: str, args, result) -> None:
     """Permanently prevents stuck loops: repeated identical tool failures and
     blind same-URL refetches trigger corrective guidance injected into the
@@ -3821,6 +3895,11 @@ def run_agent_turn(user_input: str, args) -> None:
                         wait = min(45.0, 5.0 * (conn_retries + 1))
                         engine_say(console, f"[yellow](connection dropped - retrying in {wait:.0f}s: {str(exc)[:120]})[/]")
                         wait_with_progress(console, wait, "connection dropped - reconnecting", str(exc)[:80])
+                        continue
+                    # All retries burned: if the DAEMON itself died (app updater
+                    # takes it down silently), revive it once and keep working.
+                    if STATE.get("daemon_revivals", 0) < 3 and revive_daemon(console):
+                        STATE["conn_retries"] = 0
                         continue
                     engine_emit(lambda: console.print(Panel(f"[red]Connection failed: {exc}[/]", title="ERROR", border_style="red")))
                     STATE["last_outcome"] = "chat_error"
@@ -5369,6 +5448,11 @@ def run_self_test() -> int:
         STATE["yielded"] = False
         assert kw._busy() is False, "KeepWarm should be free to act when idle"
         STATE["turn_active"] = old_turn
+
+        # 34) daemon revival plumbing: executable resolution must work here
+        _ox = _ollama_exe()
+        assert _ox and os.path.isfile(_ox), f"ollama exe resolution failed: {_ox!r}"
+        assert callable(revive_daemon) and callable(_daemon_alive)
 
         print("SELF-TEST PASS")
         return 0
