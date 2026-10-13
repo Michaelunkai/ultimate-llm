@@ -1349,15 +1349,47 @@ def tool_list_dir(args: dict) -> str:
         return f"ERROR: {exc}"
 
 
+def _iter_tree_files(root: Path, deadline: float):
+    """Yield files under root, honoring the deadline at EVERY DIRECTORY.
+
+    Path.rglob only yields matches, so its deadline can never fire while it
+    grinds through millions of non-matching directories (the 20-minute
+    find_files stall, 2026-10-12 battery). Manual scandir walk: per-directory
+    deadline checks bound overshoot to a single directory; reparse points
+    (junctions/symlinks) are never followed, so cycles are impossible."""
+    reparse_flag = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file():
+                            yield Path(entry.path)
+                        elif entry.is_dir(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            if getattr(st, "st_file_attributes", 0) & reparse_flag:
+                                continue
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        if time.monotonic() > deadline:
+            return
+
+
 @register_tool(
     "find_files",
-    "Find files by glob pattern under a root directory, recursively, on any drive. Results are capped at max_results.",
+    "Find files by glob pattern under a root directory, recursively, on any drive. Results are capped at max_results; the scan stops at max_seconds (default 60) with a deadline note.",
     {
         "type": "object",
         "properties": {
             "root": {"type": "string", "description": "Root directory to search (default: session cwd)"},
             "pattern": {"type": "string", "description": "Glob pattern, e.g. *.py (default *)"},
             "max_results": {"type": "integer", "description": "Maximum number of results (default 200)"},
+            "max_seconds": {"type": "integer", "description": "Scan deadline in seconds (default 60) - narrow the root for huge drives"},
         },
         "required": ["pattern"],
     },
@@ -1370,21 +1402,31 @@ def tool_find_files(args: dict) -> str:
             max_results = max(1, int(args.get("max_results", 200) or 200))
         except (TypeError, ValueError):
             max_results = 200
+        try:
+            deadline_s = max(5.0, float(args.get("max_seconds", 60) or 60))
+            deadline = time.monotonic() + deadline_s
+        except (TypeError, ValueError):
+            deadline_s = 60.0
+            deadline = time.monotonic() + 60.0
         if not root.exists():
             return f"ERROR: root not found: {root}"
         found = []
         stopped = ""
+        timed_out = False
         try:
-            for path in root.rglob(pattern):
+            for path in _iter_tree_files(root, deadline):
                 try:
-                    if path.is_file():
+                    if path.match(pattern):
                         found.append(str(path))
                 except OSError:
                     pass
                 if len(found) >= max_results:
                     break
+            timed_out = len(found) < max_results and time.monotonic() > deadline
         except OSError as exc:
             stopped = f" [scan stopped early: {exc}]"
+        if timed_out:
+            stopped = f" [scan stopped at its {deadline_s:.0f}s deadline before finishing - narrow the root or pattern]"
         if not found:
             return f"No files matching '{pattern}' under {root}.{stopped}"
         trunc = " (truncated at max_results)" if len(found) >= max_results else ""
@@ -1435,9 +1477,9 @@ def tool_search_files(args: dict) -> str:
             found = []
             timed_out = False
             try:
-                for path in root.rglob(base_glob):
+                for path in _iter_tree_files(root, deadline):
                     try:
-                        if path.is_file():
+                        if path.match(base_glob):
                             found.append(str(path))
                     except OSError:
                         pass
@@ -1460,14 +1502,13 @@ def tool_search_files(args: dict) -> str:
         results = []
         stopped = ""
         try:
-            for path in root.rglob(glob_pattern):
+            for path in _iter_tree_files(root, deadline):
                 if len(results) >= max_results:
                     break
-                if time.monotonic() > deadline:
-                    stopped = f" [scan hit its deadline - partial results; narrow 'root' to search the rest]"
-                    break
+                if not path.match(glob_pattern):
+                    continue
                 try:
-                    if not path.is_file() or path.stat().st_size > 2_000_000:
+                    if path.stat().st_size > 2_000_000:
                         continue
                     raw = path.read_bytes()
                     if b"\x00" in raw[:4096]:
@@ -1482,6 +1523,8 @@ def tool_search_files(args: dict) -> str:
                     continue
         except OSError as exc:
             stopped = f" [scan stopped early: {exc}]"
+        if not stopped and results and len(results) < max_results and time.monotonic() > deadline:
+            stopped = f" [scan hit its {deadline_s:.0f}s deadline - partial results; narrow 'root' to search the rest]"
         if not results:
             return f"No matches for '{query}' under {root}.{stopped}"
         trunc = " (truncated at max_results)" if len(results) >= max_results else ""
@@ -2857,13 +2900,19 @@ def chat_stream(console: Console):
     reader = threading.Thread(target=_reader, daemon=True)
     reader.start()
     stall_s = float(CONFIG.get("stream_stall_s", 45) or 45)
+    # After a watchdog kill the model may be COLD (mid-turn unload - the Ollama
+    # app's hourly maintenance can reset keep-alive, proven 2026-10-13 battery).
+    # A reload takes 30-90s, so follow-up attempts get full cold-load patience
+    # instead of being killed at 45s in a loop until the retries run out.
+    kill_recent = time.monotonic() - float(STATE.get("watchdog_kill_mono") or -1e9) < 200.0
+    effective_stall = 240.0 if kill_recent else stall_s
     try:
         while not box["done"]:
             time.sleep(0.5)
             stalled = time.monotonic() - box["last"]
             if stalled > 8 and box["chars"] == 0 and not think_parts:
                 prog.update(detail=f"0 tokens for {stalled:.0f}s - {note or 'server queue busy, still waiting'}")
-            if stalled > stall_s:
+            if stalled > effective_stall:
                 # Before killing a silent stream, check whether the model is
                 # cold-loading (first use, or the daemon restarted): silence is
                 # EXPECTED then, and killing would restart the load forever.
@@ -2875,6 +2924,7 @@ def chat_stream(console: Console):
                         note = fresh
                         prog.update(detail=f"{fresh} ({stalled:.0f}s)")
                     continue
+                STATE["watchdog_kill_mono"] = time.monotonic()
                 try:
                     client.close()  # kills the stalled stream
                 except Exception:

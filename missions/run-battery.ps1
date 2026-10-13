@@ -35,9 +35,12 @@ try {
         $sandbox = Join-Path $root $name
         $mlog = Join-Path $root ("logs\{0}-{1}.log" -f $name, $Label)
 
-        # 1) prewarm gate: daemon must answer a 1-token chat (max 120s)
+        # 1) prewarm gate: daemon must answer a 1-token chat (max 120s).
+        #    keep_alive 24h matches the harness - the Ollama default (5m) can
+        #    let the model UNLOAD mid-mission and stall in-flight streams
+        #    (proven: battery ctx-endurance2, M01 died at the expiry boundary).
         $warm = $false
-        $body = '{"model":"gpt-oss:20b","stream":false,"messages":[{"role":"user","content":"ping"}],"options":{"num_predict":1}}'
+        $body = '{"model":"gpt-oss:20b","stream":false,"messages":[{"role":"user","content":"ping"}],"options":{"num_predict":1},"keep_alive":"24h"}'
         foreach ($a in 1..40) {
             try {
                 Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:11434/api/chat' -ContentType 'application/json' -TimeoutSec 120 -Body $body | Out-Null
