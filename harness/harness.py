@@ -1010,6 +1010,90 @@ class ResourceSentinel:
         threading.Thread(target=_warm, name="sentinel-rewarm", daemon=True).start()
 
 
+KEEP_WARM_INTERVAL_S = 600.0
+
+
+class KeepWarm:
+    """Guarantees the model is resident so no turn ever waits on a cold load.
+
+    Every KEEP_WARM_INTERVAL_S it touches the model with a 1-token 24h
+    keep-alive (resets expiry before the daemon/app can lapse it) and, if
+    anything evicted it (daemon restart, app maintenance, manual unload),
+    reloads it in the BACKGROUND so the next user turn finds it hot instead
+    of stalling 30-90s on 'cold-loading weights'. Cooperates with the yield
+    sentinel: never reloads while the sentinel deliberately freed VRAM, and
+    never fires while a turn is running (turn_active)."""
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="keep-warm", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _busy(self) -> bool:
+        if STATE.get("yielded"):
+            return True
+        if STATE.get("turn_active"):
+            return True
+        if STATE.get("engine") and getattr(STATE["engine"], "active", False):
+            return True
+        s = STATE.get("sentinel")
+        if s is not None and getattr(s, "rewarming", False):
+            return True
+        return False
+
+    def _resident(self) -> bool:
+        # Unreachable daemon -> True: never race a reload against ensure-prereqs.
+        try:
+            r = _httpx().get(STATE["host"].rstrip("/") + "/api/ps", timeout=3.0)
+            for m in r.json().get("models", []):
+                if str(m.get("name", "")).startswith(str(STATE.get("model", "")).split(":")[0]):
+                    return int(m.get("size_vram", 0) or 0) > 0
+        except Exception:
+            return True
+        return False
+
+    def _warm(self, why: str) -> None:
+        try:
+            r = _httpx().post(
+                STATE["host"].rstrip("/") + "/api/generate",
+                json={"model": STATE["model"], "prompt": "", "keep_alive": "24h"},
+                timeout=240.0,
+            )
+            r.raise_for_status()
+            audit_progress("keep_warm", f"{STATE['model']} resident again ({why}) - next turn is hot")
+        except Exception as exc:
+            audit_progress("keep_warm", f"background reload failed ({why}): {str(exc)[:120]}")
+
+    def _touch(self) -> None:
+        try:
+            _httpx().post(
+                STATE["host"].rstrip("/") + "/api/generate",
+                json={"model": STATE["model"], "prompt": "ping", "keep_alive": "24h", "options": {"num_predict": 1}},
+                timeout=60.0,
+            )
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        # First cycle almost immediately: covers the launch-time cold window so
+        # even the very first message finds a hot model.
+        if not self._stop.wait(5.0) and not self._busy() and not self._resident():
+            self._warm("startup")
+        while not self._stop.wait(KEEP_WARM_INTERVAL_S):
+            if self._busy():
+                continue
+            if self._resident():
+                self._touch()
+            else:
+                self._warm("cycle")
+
+
 def _read_text_fallback(path: Path, max_bytes=None) -> str:
     raw = path.read_bytes()
     if max_bytes is not None:
@@ -3607,6 +3691,7 @@ def run_agent_turn(user_input: str, args) -> None:
     STATE["mission_text"] = user_input
     STATE["done_confirmed"] = False
     STATE["last_prompt"] = user_input
+    STATE["turn_active"] = True
     STATE["required_tools"] = parse_required_tools(user_input)
     STATE["evidence_rejects"] = 0
     STATE["url_lint_used"] = False
@@ -4143,6 +4228,7 @@ def run_agent_turn(user_input: str, args) -> None:
         STATE["last_outcome"] = "interrupted"
         return
     finally:
+        STATE["turn_active"] = False
         if turn_engine is not None and STATE.get("engine") is turn_engine:
             STATE["engine"] = None
             turn_engine.stop()
@@ -5271,6 +5357,19 @@ def run_self_test() -> int:
         assert thr64 > thr32, f"64k threshold must exceed 32k: {thr64} vs {thr32}"
         assert thr64 <= int(65536 * 0.80), f"64k threshold exceeds safety ceiling: {thr64}"
 
+        # 33) KeepWarm: zero-cold-wait guarantee plumbing (no network calls here)
+        kw = KeepWarm()
+        assert callable(kw.start) and callable(kw.stop) and callable(kw._warm)
+        old_turn = STATE.get("turn_active")
+        STATE["turn_active"] = True
+        assert kw._busy() is True, "KeepWarm must never fire while a turn is active"
+        STATE["turn_active"] = False
+        STATE["yielded"] = True
+        assert kw._busy() is True, "KeepWarm must never fight the yield sentinel"
+        STATE["yielded"] = False
+        assert kw._busy() is False, "KeepWarm should be free to act when idle"
+        STATE["turn_active"] = old_turn
+
         print("SELF-TEST PASS")
         return 0
     except AssertionError as exc:
@@ -5438,6 +5537,9 @@ def main(argv=None) -> int:
         sentinel = ResourceSentinel(console)
         STATE["sentinel"] = sentinel
         sentinel.start()
+    keep_warm = KeepWarm()
+    keep_warm.start()
+    STATE["keep_warm"] = keep_warm
     console.print(
         f"[dim]Type your goal and press Enter. Commands: /help · /undo · /update · /doctor · /memory · /verify "
         f"+{max(0, len(COMMANDS) - 5)} more  |  Up/Down = prompt history from ALL sessions[/]"
@@ -5494,6 +5596,9 @@ def main(argv=None) -> int:
 
     if sentinel is not None:
         sentinel.stop()
+    kw = STATE.get("keep_warm")
+    if kw is not None:
+        kw.stop()
     save_session()
     console.print("[bold cyan]Goodbye.[/]")
     return 0
